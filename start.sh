@@ -26,6 +26,15 @@ is_running() {
   return 1
 }
 
+health_ok() {
+  # $1 = port. Uses curl when present, else python urllib.
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf "http://127.0.0.1:$1/health" 2>/dev/null
+  else
+    "$VENV/bin/python" -c "import sys,urllib.request; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:'+sys.argv[1]+'/health',timeout=5).read().decode())" "$1" 2>/dev/null
+  fi
+}
+
 do_start() {
   if is_running; then
     echo "Already running (pid $(cat $PIDFILE)). Use ./start.sh restart"
@@ -45,14 +54,19 @@ do_start() {
 
   local port
   port=$(get_port)
-  echo "-- starting on port $port (log: $LOGFILE) --"
-  nohup "$VENV/bin/python" -m uvicorn app:app --host 0.0.0.0 --port "$port" >>"$LOGFILE" 2>&1 &
+  echo "=== $(date -u '+%F %T UTC') starting, port $port ===" >>"$LOGFILE"
+  "$VENV/bin/python" --version >>"$LOGFILE" 2>&1
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$VENV/bin/python" -u -m uvicorn app:app --host 0.0.0.0 --port "$port" >>"$LOGFILE" 2>&1 &
+  else
+    "$VENV/bin/python" -u -m uvicorn app:app --host 0.0.0.0 --port "$port" >>"$LOGFILE" 2>&1 &
+  fi
   echo $! > "$PIDFILE"
   local tries=0
   while [ $tries -lt 10 ]; do
     sleep 2
     tries=$((tries + 1))
-    if curl -sf "http://127.0.0.1:$port/health" 2>/dev/null; then
+    if health_ok "$port"; then
       echo ""
       echo "Running (pid $(cat $PIDFILE))."
       return 0
@@ -88,7 +102,7 @@ case "${1:-start}" in
   status)
     if is_running; then
       echo "Running (pid $(cat $PIDFILE))"
-      curl -s "http://127.0.0.1:$(get_port)/health" || true
+      health_ok "$(get_port)" || true
       echo ""
     else
       echo "Stopped."
