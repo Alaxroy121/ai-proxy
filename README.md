@@ -48,6 +48,15 @@ print(c.chat.completions.create(model="openai/gpt-4o-mini",
 - `GET /keys/status` - which key is live / cooling down
 - `POST /keys/reload` - reload keys after editing env
 
+## Storage: local file vs MongoDB
+
+Unstable server disk (files like `keys.txt` / `proxy.log` vanish)? Set
+`MONGODB_URI` in `.env` (free Atlas cluster → Connect → copy string).
+Keys added via Telegram + per-key token counters then live in MongoDB
+(`ai_proxy.proxy_keys`) and survive restarts/wipes. Empty `MONGODB_URI`
+= local `keys.txt` + in-memory counters. If Mongo is unreachable at boot,
+the proxy warns and falls back to local — it never crashes over storage.
+
 ## Telegram DM control (recommended)
 
 No webhook / no extra port. Bot polls Telegram from inside the proxy (same process, shares memory).

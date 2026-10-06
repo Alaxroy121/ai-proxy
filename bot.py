@@ -129,11 +129,13 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     import app as appmod
+    pool = ctx.bot_data["pool"]
     await update.message.reply_text(
         "⚙️ *config*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
         f"mode: strict 1→2→3 rotation (new key every request)\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
+        f"store: `{pool.store.label if pool.store else 'file'}`\n"
         f"max retries: `{appmod.MAX_RETRIES_PER_REQUEST}`\n"
         f"timeout: `{appmod.REQUEST_TIMEOUT_SEC}s`\n"
         f"keys file: `{appmod.KEYS_FILE}`",

@@ -92,11 +92,15 @@ class KeyPool:
         self.keys: List[KeyState] = [KeyState(k) for k in keys]
         self._pos = 0
         self._lock = asyncio.Lock()
+        self.store = None  # attached in lifespan (file or mongo)
 
-    def reload(self, keys: List[str]):
-        # keep stats for existing keys, add new ones
-        existing = {k.key: k for k in self.keys}
-        self.keys = [existing.get(k, KeyState(k)) for k in keys]
+    async def reload(self, keys: List[str]):
+        async with self._lock:
+            # keep stats for existing keys, add new ones
+            existing = {k.key: k for k in self.keys}
+            self.keys = [existing.get(k, KeyState(k)) for k in keys]
+            self._pos = 0
+        await self._persist_keys()
 
     @property
     def size(self) -> int:
@@ -119,14 +123,17 @@ class KeyPool:
         async with self._lock:
             ks.success += 1
             ks.tokens_used += max(0, tokens)
+        await self._persist_one(ks, tokens=max(0, tokens), success=1)
 
     async def add_usage(self, ks: KeyState, tokens: int):
         async with self._lock:
             ks.tokens_used += max(0, tokens)
+        await self._persist_one(ks, tokens=max(0, tokens))
 
     async def mark_failed(self, ks: KeyState):
         async with self._lock:
             ks.fails += 1
+        await self._persist_one(ks, fails=1)
 
     async def status(self):
         return [
@@ -150,7 +157,7 @@ class KeyPool:
             if any(k.key == key for k in self.keys):
                 return False
             self.keys.append(KeyState(key))
-        save_keys_list([k.key for k in self.keys])
+        await self._persist_keys()
         return True
 
     def _find_index(self, ident: str) -> Optional[int]:
@@ -173,7 +180,7 @@ class KeyPool:
                 return None
             masked = self.keys[i].masked
             del self.keys[i]
-        save_keys_list([k.key for k in self.keys])
+        await self._persist_keys()
         return masked
 
     async def set_enabled(self, ident: str, enabled: bool) -> Optional[str]:
@@ -183,7 +190,9 @@ class KeyPool:
                 return None
             ks = self.keys[i]
             ks.disabled = not enabled
-            return ks.masked
+            masked, off = ks.masked, ks.disabled
+        await self._persist_one(ks, disabled=off)
+        return masked
 
     async def reset_usage(self):
         """Zero token counters + fail counts (budgets restart)."""
@@ -191,9 +200,62 @@ class KeyPool:
             for ks in self.keys:
                 ks.tokens_used = 0
                 ks.fails = 0
+        if self.store is not None:
+            try:
+                await self.store.reset_usage()
+            except Exception as e:
+                print(f"[store] reset failed: {e}")
 
     async def reset_all(self):
         await self.reset_usage()
+
+    async def use_store(self, store):
+        """Attach persistence and adopt its keys/counters (mongo wins if non-empty)."""
+        self.store = store
+        try:
+            docs = await store.load()
+        except Exception as e:
+            print(f"[store] load from {store.label} failed: {e}; keeping local keys")
+            return
+        if not docs:
+            return
+        async with self._lock:
+            existing = {k.key: k for k in self.keys}
+            merged = []
+            for d in sorted(docs, key=lambda x: x.get("order", 0)):
+                k = d.get("key")
+                if not k:
+                    continue
+                ks = existing.get(k, KeyState(k))
+                ks.tokens_used = int(d.get("tokens_used", ks.tokens_used or 0))
+                ks.success = int(d.get("success", ks.success or 0))
+                ks.fails = int(d.get("fails", ks.fails or 0))
+                if "disabled" in d:
+                    ks.disabled = bool(d["disabled"])
+                merged.append(ks)
+            self.keys = merged
+
+    async def _persist_keys(self):
+        if self.store is None:
+            try:
+                save_keys_list([k.key for k in self.keys])
+            except Exception as e:
+                print(f"[store] file save failed: {e}")
+            return
+        try:
+            await self.store.save_keys([k.key for k in self.keys])
+        except Exception as e:
+            print(f"[store] save to {self.store.label} failed: {e}")
+
+    async def _persist_one(self, ks: KeyState, tokens: int = 0, success: int = 0,
+                           fails: int = 0, disabled: Optional[bool] = None):
+        if self.store is None:
+            return
+        try:
+            await self.store.update_key(ks.key, tokens=tokens, success=success,
+                                        fails=fails, disabled=disabled)
+        except Exception as e:
+            print(f"[store] update {self.store.label} failed: {e}")
 
 
 pool = KeyPool(load_keys_list())
@@ -236,7 +298,17 @@ def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app
-    # Start Telegram control bot (polling, same process so it shares KeyPool memory)
+    # Attach persistence first: mongo (survives unstable disk) or local file
+    from store import FileStore, build_store
+    store = build_store(KEYS_FILE)
+    try:
+        await store.connect()
+        print(f"[store] using {store.label}")
+    except Exception as e:
+        print(f"[store] {e}; falling back to local file")
+        store = FileStore(KEYS_FILE)
+    app.state.store = store
+    await pool.use_store(store)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_IDS:
         try:
             from bot import build_bot_app
@@ -257,6 +329,10 @@ async def lifespan(app: FastAPI):
             await tg_app.shutdown()
         except Exception:
             pass
+    try:
+        await app.state.store.close()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="AI Key Rotating Proxy", version="1.2.0", lifespan=lifespan)
@@ -318,7 +394,7 @@ async def keys_status(_=Depends(check_proxy_auth)):
 async def keys_reload(_=Depends(check_proxy_auth)):
     # re-read from env (useful if you update keys via env restart script)
     load_dotenv(override=True)
-    pool.reload(parse_keys(os.getenv("API_KEYS", "")))
+    await pool.reload(parse_keys(os.getenv("API_KEYS", "")))
     return {"reloaded": pool.size}
 
 
@@ -372,7 +448,6 @@ async def proxy_request(request: Request):
             if resp.status_code < 400:
                 if "text/event-stream" in ctype:
                     await pool.mark_success(ks)
-                    raw = resp.content if hasattr(resp, "content") else b""
 
                     async def gen():
                         buf = bytearray()
