@@ -11,7 +11,7 @@ LOGFILE="proxy.log"
 get_port() {
   local p=""
   if [ -f .env ]; then
-    p=$(grep -E '^PORT=' .env | cut -d= -f2 | tr -d ' ' || true)
+    p=$(grep -E '^PORT=' .env | cut -d= -f2 | tr -cd '0-9' || true)
   fi
   echo "${p:-8000}"
 }
@@ -48,15 +48,27 @@ do_start() {
   echo "-- starting on port $port (log: $LOGFILE) --"
   nohup "$VENV/bin/python" -m uvicorn app:app --host 0.0.0.0 --port "$port" >>"$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
-  sleep 3
-  if is_running; then
-    echo "Running (pid $(cat $PIDFILE)). Health:"
-    curl -s "http://127.0.0.1:$port/health" || echo "(health check failed - see $LOGFILE)"
-    echo ""
-  else
-    echo "Failed to start - see $LOGFILE"
+  local tries=0
+  while [ $tries -lt 10 ]; do
+    sleep 2
+    tries=$((tries + 1))
+    if curl -sf "http://127.0.0.1:$port/health" 2>/dev/null; then
+      echo ""
+      echo "Running (pid $(cat $PIDFILE))."
+      return 0
+    fi
+    if ! is_running; then
+      break
+    fi
+  done
+  echo "Health check failed - last log lines:"
+  tail -n 30 "$LOGFILE" || true
+  if ! is_running; then
+    echo "Process died on startup (see above)."
     exit 1
   fi
+  echo "(server running but not answering /health yet - check $LOGFILE)"
+  exit 1
 }
 
 do_stop() {
