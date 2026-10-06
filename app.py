@@ -206,12 +206,6 @@ if not Path(KEYS_FILE).exists() and pool.size:
 tg_app = None  # telegram Application, set in lifespan when enabled
 
 
-def set_token_limit(n: int) -> int:
-    global MAX_TOKENS_PER_KEY
-    MAX_TOKENS_PER_KEY = max(0, n)
-    return MAX_TOKENS_PER_KEY
-
-
 def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> int:
     """Real usage.total_tokens when upstream reports it, else chars // 4 estimate."""
     if isinstance(data, dict):

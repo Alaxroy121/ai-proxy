@@ -12,8 +12,7 @@ Commands (DM the bot):
   /enable <n>      - re-enable a disabled key
   /disable <n>     - manually take a key offline
   /reset | /resetusage - zero all token counters
-  /setlimit <n>    - preemptive tokens-per-key budget, 0 = unlimited
-  /help
+  /help (limit is set in .env as MAX_TOKENS_PER_KEY)
 Auto-alerts every 30s: key hit budget / all keys over budget.
 """
 import os
@@ -40,6 +39,15 @@ async def _deny(update: Update):
         await update.message.reply_text("⛔ Not authorized. Your ID is not in TELEGRAM_ADMIN_IDS.")
 
 
+def _bar(used: int, limit: int, width: int = 12) -> str:
+    """Unique progress style: ▰ filled, ▱ empty, clamped, with %."""
+    if limit <= 0:
+        return f"`{used:,}` (no limit)"
+    pct = min(100, int(used * 100 / limit))
+    fill = min(width, int(used * width / limit))
+    return f"`{'▰' * fill}{'▱' * (width - fill)}` {pct}% ({used:,}/{limit:,})"
+
+
 def _stats_lines(pool) -> list[str]:
     import app as appmod
     lim = appmod.MAX_TOKENS_PER_KEY
@@ -51,8 +59,7 @@ def _stats_lines(pool) -> list[str]:
             state, extra = "❌", "over budget"
         else:
             state, extra = "✅", "in rotation"
-        use = f"{ks.tokens_used:,}/{lim:,}" if lim else f"{ks.tokens_used:,} (no limit)"
-        lines.append(f"{i}. {state} `{ks.masked}` {use} ok={ks.success} fail={ks.fails} ({extra})")
+        lines.append(f"{i}. {state} `{ks.masked}` {_bar(ks.tokens_used, lim)} ok={ks.success} fail={ks.fails} ({extra})")
     return lines or ["(no keys)"]
 
 
@@ -62,7 +69,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Proxy control online. Strict 1→2→3 rotation + token budgets.\n"
         "/health /stats /config\n"
-        "/add /rm /enable /disable /reset /setlimit\n"
+        "/add /rm /enable /disable /reset\n"
         "Send /help for details."
     )
 
@@ -79,9 +86,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/rm <num|mask> – remove key\n"
         "/enable <num> – re-enable key\n"
         "/disable <num> – take key offline\n"
-        "/reset – zero all token counters\n"
-        "/setlimit <tokens> – budget per key, 0 = unlimited\n"
-        "e.g. /setlimit 50000",
+        "/reset – zero all token counters",
     )
 
 
@@ -91,12 +96,12 @@ def _make_health(pool):
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     lim = appmod.MAX_TOKENS_PER_KEY
-    budget = f"{used:,}/{lim * total:,}" if lim else f"{used:,} (no limit)"
+    budget = _bar(used, lim * total) if lim else f"{used:,} (no limit)"
     return (
         f"❤️ *health*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
         f"keys: {avail}/{total} in rotation\n"
-        f"tokens used: {budget}"
+        f"tokens total: {budget}"
     )
 
 
@@ -176,16 +181,6 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("♻️ All token counters zeroed.")
 
 
-async def cmd_setlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return await _deny(update)
-    if len(ctx.args) != 1 or not ctx.args[0].isdigit():
-        return await update.message.reply_text("Usage: /setlimit <tokens-per-key>  e.g. /setlimit 50000 (0 = unlimited)")
-    import app as appmod
-    lim = appmod.set_token_limit(int(ctx.args[0]))
-    await update.message.reply_text(f"⚙️ Budget updated: {lim:,} tokens/key.\n(Restart resets to .env value.)")
-
-
 async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
     """Background job: alert when a key hits budget / all keys over budget."""
     pool = ctx.bot_data["pool"]
@@ -233,7 +228,6 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("disable", cmd_disable))
     app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
-    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
     return app

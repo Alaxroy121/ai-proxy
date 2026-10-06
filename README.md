@@ -66,6 +66,6 @@ DM commands:
 - `/rm <num>` - remove key by number from `/stats`
 - `/enable <num>` / `/disable <num>` - manual on/off
 - `/reset` - zero all token counters
-- `/setlimit 50000` - change tokens-per-key budget (`0` = unlimited)
+- Budget is `.env`-only: `MAX_TOKENS_PER_KEY` (restart proxy to change)
 
 Auto-alerts: bot DMs you when a key hits its budget or ALL keys are over budget.
