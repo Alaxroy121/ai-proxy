@@ -1,0 +1,7 @@
+.env
+keys.txt
+.venv/
+__pycache__/
+*.pyc
+proxy.log
+.proxy.pid
