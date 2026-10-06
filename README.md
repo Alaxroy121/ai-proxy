@@ -67,7 +67,7 @@ Setup (2 min):
 3. Restart: `./start.sh restart`
 4. DM your bot `/health`
 
-DM commands:
+DM commands (also in the `/` menu + buttons under `/start`):
 - `/health` - upstream + keys in rotation + tokens used
 - `/stats` - overall total bar + per-key usage bars (masked keys only)
 - `/config` - budget, timeouts, upstream
@@ -77,4 +77,6 @@ DM commands:
 - `/reset` - zero all token counters
 - Budget is `.env`-only: `MAX_TOKENS_PER_KEY` (restart proxy to change)
 
-Auto-alerts: bot DMs you when a key hits its budget or ALL keys are over budget.
+Auto-alerts: budget/over-budget + **live progress pushes at 50/80/100%
+per key** (no need to spam `/stats`). Optional auto-digest:
+`LIVE_DIGEST_MIN=10` pushes `/stats` every 10 min while usage changes.

@@ -17,10 +17,44 @@ Auto-alerts every 30s: key hit budget / all keys over budget.
 """
 import os
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 ADMIN_IDS = {s.strip() for s in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if s.strip()}
+MILESTONES = (50, 80, 100)  # live progress pushes when a key crosses these %
+
+COMMAND_MENU = [
+    ("start", "Control panel with buttons"),
+    ("health", "Upstream + overall usage"),
+    ("stats", "Live per-key usage bars"),
+    ("config", "Budget, store, timeouts"),
+    ("add", "Add a provider key: /add <key>"),
+    ("rm", "Remove a key: /rm <num>"),
+    ("enable", "Re-enable a key: /enable <num>"),
+    ("disable", "Take a key offline: /disable <num>"),
+    ("reset", "Zero all token counters"),
+    ("help", "All commands"),
+]
+
+HELP_TEXT = (
+    "Commands:\n"
+    "/health – totals + upstream\n"
+    "/stats – live overall + per-key bars\n"
+    "/config – budget, store & timeouts\n"
+    "/add <full-key> – add key\n"
+    "/rm <num|mask> – remove key\n"
+    "/enable <num> – re-enable key\n"
+    "/disable <num> – take key offline\n"
+    "/reset – zero all token counters\n"
+    "📈 Live: auto-push at 50/80/100% per key."
+)
+
+MAIN_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📊 Stats", callback_data="stats"),
+     InlineKeyboardButton("❤️ Health", callback_data="health")],
+    [InlineKeyboardButton("⚙️ Config", callback_data="config"),
+     InlineKeyboardButton("ℹ️ Help", callback_data="help")],
+])
 
 
 def _admin_ids() -> set:
@@ -67,27 +101,67 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await update.message.reply_text(
-        "🤖 Proxy control online. Strict 1→2→3 rotation + token budgets.\n"
-        "/health /stats /config\n"
-        "/add /rm /enable /disable /reset\n"
-        "Send /help for details."
+        "🤖 *Proxy control panel*\n"
+        "Strict 1→2→3 rotation + per-key budgets.\n"
+        "📈 Live progress auto-pushes at 50/80/100%.",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    await update.message.reply_text(
-        "Commands:\n"
-        "/health – totals + upstream\n"
-        "/stats – per-key usage (numbers used by rm/enable/disable)\n"
-        "/config – token budget & timeouts\n"
-        "/add <full-key> – add key\n"
-        "/rm <num|mask> – remove key\n"
-        "/enable <num> – re-enable key\n"
-        "/disable <num> – take key offline\n"
-        "/reset – zero all token counters",
+    await update.message.reply_text(HELP_TEXT)
+
+
+def render_stats(pool) -> str:
+    import app as appmod
+    total = len(pool.keys)
+    used = sum(k.tokens_used for k in pool.keys)
+    lim = appmod.MAX_TOKENS_PER_KEY
+    overall = _bar(used, lim * total) if lim else f"`{used:,}` (no limit)"
+    return f"📊 *overall* {overall}\n\n🔑 *per key*\n" + "\n".join(_stats_lines(pool))
+
+
+def render_config(pool=None) -> str:
+    import app as appmod
+    store = pool.store.label if pool is not None and pool.store else "file"
+    return (
+        "⚙️ *config*\n"
+        f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
+        f"mode: strict 1→2→3 rotation (new key every request)\n"
+        f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
+        f"live milestones: `50/80/100%`\n"
+        f"auto digest: `{os.getenv('LIVE_DIGEST_MIN', '0')} min (0 = off)`\n"
+        f"store: `{store}`\n"
+        f"max retries: `{appmod.MAX_RETRIES_PER_REQUEST}`\n"
+        f"timeout: `{appmod.REQUEST_TIMEOUT_SEC}s`\n"
+        f"keys file: `{appmod.KEYS_FILE}`"
     )
+
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Inline buttons under /start (professional bot UX)."""
+    q = update.callback_query
+    if not q or not _is_admin(update):
+        if q:
+            await q.answer("⛔ Not authorized.", show_alert=True)
+        return
+    await q.answer()
+    pool = ctx.bot_data["pool"]
+    if q.data == "stats":
+        text = render_stats(pool)
+    elif q.data == "health":
+        text = _make_health(pool)
+    elif q.data == "config":
+        text = render_config(pool)
+    else:
+        text = HELP_TEXT
+    try:
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    except Exception:
+        pass
 
 
 def _make_health(pool):
@@ -114,33 +188,13 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    import app as appmod
-    pool = ctx.bot_data["pool"]
-    total = len(pool.keys)
-    used = sum(k.tokens_used for k in pool.keys)
-    lim = appmod.MAX_TOKENS_PER_KEY
-    overall = _bar(used, lim * total) if lim else f"`{used:,}` (no limit)"
-    await update.message.reply_text(
-        f"📊 *overall* {overall}\n\n🔑 *per key*\n" + "\n".join(_stats_lines(pool)),
-        parse_mode="Markdown")
+    await update.message.reply_text(render_stats(ctx.bot_data["pool"]), parse_mode="Markdown")
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    import app as appmod
-    pool = ctx.bot_data["pool"]
-    await update.message.reply_text(
-        "⚙️ *config*\n"
-        f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
-        f"mode: strict 1→2→3 rotation (new key every request)\n"
-        f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
-        f"store: `{pool.store.label if pool.store else 'file'}`\n"
-        f"max retries: `{appmod.MAX_RETRIES_PER_REQUEST}`\n"
-        f"timeout: `{appmod.REQUEST_TIMEOUT_SEC}s`\n"
-        f"keys file: `{appmod.KEYS_FILE}`",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(render_config(ctx.bot_data["pool"]), parse_mode="Markdown")
 
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -187,7 +241,60 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await ctx.bot_data["pool"].reset_usage()
+    ctx.bot_data.pop("ms", None)  # restart live milestones from zero
     await update.message.reply_text("♻️ All token counters zeroed.")
+
+
+def _pct(used: int, limit: int) -> int:
+    return min(100, int(used * 100 / limit)) if limit > 0 else 0
+
+
+async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
+    """Live usage pushes: milestones 50/80/100% per key + optional digest."""
+    import time
+    import app as appmod
+    pool = ctx.bot_data["pool"]
+    lim = appmod.MAX_TOKENS_PER_KEY
+    if lim <= 0:
+        return
+    ms: dict = ctx.bot_data.setdefault("ms", {})
+    seeded = "ms_seeded" in ctx.bot_data
+    for ks in pool.keys:
+        pct = _pct(ks.tokens_used, lim)
+        prev = ms.get(ks.masked)
+        if not seeded:
+            ms[ks.masked] = pct  # silent baseline, no spam after restart
+            continue
+        hit = [m for m in MILESTONES if (prev or 0) < m <= pct]
+        ms[ks.masked] = pct
+        if hit:
+            bar = _bar(ks.tokens_used, lim)
+            for aid in _admin_ids():
+                try:
+                    await ctx.bot.send_message(
+                        int(aid),
+                        f"📈 `{ks.masked}` hit {hit[-1]}%\n{bar}",
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+    ctx.bot_data["ms_seeded"] = True
+    # optional periodic digest (LIVE_DIGEST_MIN=0 disables)
+    try:
+        every = int(os.getenv("LIVE_DIGEST_MIN", "0"))
+    except ValueError:
+        every = 0
+    if every > 0:
+        used = sum(k.tokens_used for k in pool.keys)
+        last_t = ctx.bot_data.get("digest_t", 0)
+        if time.time() - last_t >= every * 60 and used != ctx.bot_data.get("digest_used"):
+            ctx.bot_data["digest_t"] = time.time()
+            ctx.bot_data["digest_used"] = used
+            for aid in _admin_ids():
+                try:
+                    await ctx.bot.send_message(int(aid), f"⏱ *auto update*\n{render_stats(pool)}",
+                                               parse_mode="Markdown")
+                except Exception:
+                    pass
 
 
 async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
@@ -223,10 +330,19 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
     ctx.bot_data["prev_over"] = cur
 
 
+async def _post_init(app: Application):
+    from telegram import BotCommand
+    try:
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMAND_MENU])
+    except Exception as e:
+        print(f"[telegram] menu set failed: {e}")
+
+
 def build_bot_app(pool) -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
     app.bot_data["pool"] = pool
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("health", cmd_health))
@@ -239,4 +355,5 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
+        app.job_queue.run_repeating(live_progress, interval=30, first=15)
     return app
