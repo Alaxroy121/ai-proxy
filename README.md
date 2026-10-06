@@ -1,18 +1,17 @@
 # AI Key-Rotating Proxy (OpenRouter / OpenAI-compatible)
 
-Same model + same provider. Auto-switches API key when one key's credits are used up.
+Strict 1→2→3 rotation + preemptive token budgets. A new key is used for
+every request; a key that reaches `MAX_TOKENS_PER_KEY` is skipped BEFORE
+the provider can rate-limit or error.
 
 ## How it works
 - You give it N keys: `API_KEYS=key1,key2,key3`
-- Clients call **the proxy** instead of OpenRouter directly:
-  `POST http://YOUR-VPS:8000/v1/chat/completions`
-- Proxy injects `Authorization: Bearer <one-of-your-keys>`, forwards to `https://openrouter.ai/api/v1/...`
-- If upstream returns:
-  - `402` / `insufficient credits/quota/balance` / `401 invalid key` -> key marked **exhausted** (cooldown 1h default), auto-retries with **next key**
-  - `429` rate-limit -> key cooldown 60s, retry next key
-  - `5xx` -> try next key
-  - `2xx` -> return to client
-- Round-robin across healthy keys. Check `/keys/status`.
+- Clients call **the proxy** instead of the provider directly:
+  `POST http://YOUR-VPS:25007/v1/chat/completions`
+- Request 1 → key1, request 2 → key2, request 3 → key3, request 4 → key1…
+- If a key errors (402/401/429/5xx), the same request retries with the next key
+- Token counting: real `usage.total_tokens` when upstream reports it,
+  otherwise estimated as chars ÷ 4. Budgets reset on restart or `/resetusage`
 
 ## Run on VPS (no Docker)
 
@@ -60,13 +59,13 @@ Setup (2 min):
 4. DM your bot `/health`
 
 DM commands:
-- `/health` - upstream + available/total
-- `/stats` - per-key table (masked keys only, never full)
-- `/config` - cooldowns, timeouts, upstream
+- `/health` - upstream + keys in rotation + tokens used
+- `/stats` - per-key usage `used/limit` (masked keys only, never full)
+- `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
 - `/rm <num>` - remove key by number from `/stats`
 - `/enable <num>` / `/disable <num>` - manual on/off
-- `/reset` - clear all cooldowns
-- `/setcool 60 3600` - change rate-limit / exhausted cooldowns
+- `/reset` - zero all token counters
+- `/setlimit 50000` - change tokens-per-key budget (`0` = unlimited)
 
-Auto-alerts: bot DMs you when a key dies, recovers, or ALL keys are dead.
+Auto-alerts: bot DMs you when a key hits its budget or ALL keys are over budget.

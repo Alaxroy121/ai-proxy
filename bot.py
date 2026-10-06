@@ -5,19 +5,18 @@ Shares the same KeyPool object (same process) -> live health + config changes.
 
 Commands (DM the bot):
   /health          - upstream, total/available keys
-  /stats | /keys   - per-key table (masked, never full keys)
-  /config          - cooldowns, upstream, timeouts
+  /stats | /keys   - per-key table with token usage (masked, never full keys)
+  /config          - token limit, upstream, timeouts
   /add <full-key>  - append a new provider key (persists to keys.txt)
   /rm <n|mask>     - remove key by number (see /stats) or masked id
-  /enable <n>      - clear cooldown / re-enable key
-  /disable <n>     - manually disable key (24h)
-  /reset           - clear all cooldowns
-  /setcool <rate_s> <exhausted_s> - e.g. /setcool 60 3600
+  /enable <n>      - re-enable a disabled key
+  /disable <n>     - manually take a key offline
+  /reset | /resetusage - zero all token counters
+  /setlimit <n>    - preemptive tokens-per-key budget, 0 = unlimited
   /help
-Auto-alerts every 30s: key died / all keys dead / recovered.
+Auto-alerts every 30s: key hit budget / all keys over budget.
 """
 import os
-import time
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -42,14 +41,18 @@ async def _deny(update: Update):
 
 
 def _stats_lines(pool) -> list[str]:
+    import app as appmod
+    lim = appmod.MAX_TOKENS_PER_KEY
     lines = []
     for i, ks in enumerate(pool.keys, start=1):
-        ok = "✅" if time.time() >= ks.disabled_until else "❌"
-        extra = ""
-        if ks.disabled_reason:
-            left = max(0, int(ks.disabled_until - time.time()))
-            extra = f" | {ks.disabled_reason} ({left}s)"
-        lines.append(f"{i}. {ok} `{ks.masked}` ok={ks.success} fail={ks.fails}{extra}")
+        if ks.disabled:
+            state, extra = "⛔", "disabled"
+        elif ks.over_budget():
+            state, extra = "❌", "over budget"
+        else:
+            state, extra = "✅", "in rotation"
+        use = f"{ks.tokens_used:,}/{lim:,}" if lim else f"{ks.tokens_used:,} (no limit)"
+        lines.append(f"{i}. {state} `{ks.masked}` {use} ok={ks.success} fail={ks.fails} ({extra})")
     return lines or ["(no keys)"]
 
 
@@ -57,9 +60,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await update.message.reply_text(
-        "🤖 Proxy control online.\n"
+        "🤖 Proxy control online. Strict 1→2→3 rotation + token budgets.\n"
         "/health /stats /config\n"
-        "/add /rm /enable /disable /reset /setcool\n"
+        "/add /rm /enable /disable /reset /setlimit\n"
         "Send /help for details."
     )
 
@@ -70,26 +73,30 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
         "/health – totals + upstream\n"
-        "/stats – per-key status (numbers used by rm/enable/disable)\n"
-        "/config – cooldowns & timeouts\n"
+        "/stats – per-key usage (numbers used by rm/enable/disable)\n"
+        "/config – token budget & timeouts\n"
         "/add <full-key> – add key\n"
         "/rm <num|mask> – remove key\n"
         "/enable <num> – re-enable key\n"
         "/disable <num> – take key offline\n"
-        "/reset – clear all cooldowns\n"
-        "/setcool <rate_s> <exhausted_s>\n"
-        "e.g. /setcool 60 3600",
+        "/reset – zero all token counters\n"
+        "/setlimit <tokens> – budget per key, 0 = unlimited\n"
+        "e.g. /setlimit 50000",
     )
 
 
 def _make_health(pool):
     import app as appmod
     total = len(pool.keys)
-    avail = sum(1 for k in pool.keys if time.time() >= k.disabled_until)
+    avail = sum(1 for k in pool.keys if k.available)
+    used = sum(k.tokens_used for k in pool.keys)
+    lim = appmod.MAX_TOKENS_PER_KEY
+    budget = f"{used:,}/{lim * total:,}" if lim else f"{used:,} (no limit)"
     return (
         f"❤️ *health*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
-        f"keys: {avail}/{total} available"
+        f"keys: {avail}/{total} in rotation\n"
+        f"tokens used: {budget}"
     )
 
 
@@ -113,8 +120,8 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚙️ *config*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
-        f"rate-limit cooldown: `{appmod.COOLDOWN_RATE_LIMIT_SEC}s`\n"
-        f"exhausted cooldown: `{appmod.COOLDOWN_EXHAUSTED_SEC}s`\n"
+        f"mode: strict 1→2→3 rotation (new key every request)\n"
+        f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"max retries: `{appmod.MAX_RETRIES_PER_REQUEST}`\n"
         f"timeout: `{appmod.REQUEST_TIMEOUT_SEC}s`\n"
         f"keys file: `{appmod.KEYS_FILE}`",
@@ -165,50 +172,51 @@ async def cmd_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    await ctx.bot_data["pool"].reset_all()
-    await update.message.reply_text("♻️ All cooldowns cleared.")
+    await ctx.bot_data["pool"].reset_usage()
+    await update.message.reply_text("♻️ All token counters zeroed.")
 
 
-async def cmd_setcool(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_setlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 2 or not all(a.isdigit() for a in ctx.args):
-        return await update.message.reply_text("Usage: /setcool <rate_s> <exhausted_s>  e.g. /setcool 60 3600")
+    if len(ctx.args) != 1 or not ctx.args[0].isdigit():
+        return await update.message.reply_text("Usage: /setlimit <tokens-per-key>  e.g. /setlimit 50000 (0 = unlimited)")
     import app as appmod
-    r, e = appmod.set_cooldowns(int(ctx.args[0]), int(ctx.args[1]))
-    await update.message.reply_text(f"⚙️ Cooldowns updated: rate={r}s exhausted={e}s.\n(Restart resets to .env values.)")
+    lim = appmod.set_token_limit(int(ctx.args[0]))
+    await update.message.reply_text(f"⚙️ Budget updated: {lim:,} tokens/key.\n(Restart resets to .env value.)")
 
 
 async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
-    """Background job: alert admins on key down / all-dead / recovery."""
+    """Background job: alert when a key hits budget / all keys over budget."""
     pool = ctx.bot_data["pool"]
-    prev: dict = ctx.bot_data.setdefault("prev_avail", {})
-    cur = {k.masked: (time.time() >= k.disabled_until) for k in pool.keys}
+    prev: dict = ctx.bot_data.setdefault("prev_over", {})
+    cur = {k.masked: (k.over_budget() or k.disabled) for k in pool.keys}
     if not prev:
-        ctx.bot_data["prev_avail"] = cur
+        ctx.bot_data["prev_over"] = cur
         return
-    for masked, ok in cur.items():
-        was = prev.get(masked, True)
-        if was and not ok:
-            reason = next((k.disabled_reason for k in pool.keys if k.masked == masked), "")
+    for masked, out in cur.items():
+        was = prev.get(masked, False)
+        if out and not was:
+            ks = next((k for k in pool.keys if k.masked == masked), None)
+            why = "disabled" if ks and ks.disabled else f"budget hit ({ks.tokens_used:,} tokens)"
             for aid in _admin_ids():
                 try:
-                    await ctx.bot.send_message(int(aid), f"⚠️ Key down: `{masked}`\n{reason}", parse_mode="Markdown")
+                    await ctx.bot.send_message(int(aid), f"⚠️ Key out: `{masked}`\n{why}", parse_mode="Markdown")
                 except Exception:
                     pass
-        elif not was and ok:
+        elif was and not out:
             for aid in _admin_ids():
                 try:
-                    await ctx.bot.send_message(int(aid), f"✅ Key recovered: `{masked}`", parse_mode="Markdown")
+                    await ctx.bot.send_message(int(aid), f"✅ Key back in rotation: `{masked}`", parse_mode="Markdown")
                 except Exception:
                     pass
-    if cur and not any(cur.values()) and any(prev.values()):
+    if cur and all(cur.values()) and not all(prev.values()):
         for aid in _admin_ids():
             try:
-                await ctx.bot.send_message(int(aid), "🚨 ALL keys exhausted! Add keys with /add <key>")
+                await ctx.bot.send_message(int(aid), "🚨 ALL keys over budget/disabled! /resetusage or /add <key>")
             except Exception:
                 pass
-    ctx.bot_data["prev_avail"] = cur
+    ctx.bot_data["prev_over"] = cur
 
 
 def build_bot_app(pool) -> Application:
@@ -224,8 +232,8 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler(["rm", "remove", "del"], cmd_rm))
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("disable", cmd_disable))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("setcool", cmd_setcool))
+    app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
+    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
     return app

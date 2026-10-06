@@ -1,11 +1,10 @@
 """
 AI API rotating proxy - OpenRouter / any OpenAI-compatible upstream.
-Same model + same provider, auto-switch API key when credits/rate-limit hit.
+Strict 1->2->3 rotation (new key every request) + preemptive per-key
+token budgets: switch BEFORE the provider errors.
 """
 import asyncio
 import os
-import time
-import itertools
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,8 +23,10 @@ API_KEYS_RAW = os.getenv("API_KEYS", "")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
 HTTP_REFERER = os.getenv("HTTP_REFERER", "")
 X_TITLE = os.getenv("X_TITLE", "Key Rotating Proxy")
-COOLDOWN_RATE_LIMIT_SEC = int(os.getenv("COOLDOWN_RATE_LIMIT_SEC", "60"))
-COOLDOWN_EXHAUSTED_SEC = int(os.getenv("COOLDOWN_EXHAUSTED_SEC", "3600"))
+# Preemptive budget: switch to next key BEFORE the provider errors.
+# 0 = unlimited. Counts real `usage.total_tokens` when upstream reports it,
+# else estimates (chars // 4). Resets on restart, or via Telegram /resetusage.
+MAX_TOKENS_PER_KEY = int(os.getenv("MAX_TOKENS_PER_KEY", "0"))
 MAX_RETRIES_PER_REQUEST = int(os.getenv("MAX_RETRIES_PER_REQUEST", "10"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "120"))
 KEYS_FILE = os.getenv("KEYS_FILE", "keys.txt")  # one full key per line, persists Telegram-added keys
@@ -69,27 +70,27 @@ class KeyState:
     masked: str = field(init=False)
     success: int = 0
     fails: int = 0
-    disabled_until: float = 0.0
-    disabled_reason: str = ""
+    tokens_used: int = 0
+    disabled: bool = False  # manual off via Telegram
 
     def __post_init__(self):
         k = self.key
         self.masked = f"{k[:7]}...{k[-4:]}" if len(k) > 12 else "***"
 
+    def over_budget(self) -> bool:
+        return MAX_TOKENS_PER_KEY > 0 and self.tokens_used >= MAX_TOKENS_PER_KEY
+
     @property
     def available(self) -> bool:
-        return time.time() >= self.disabled_until
-
-    def cooldown_left(self) -> int:
-        return max(0, int(self.disabled_until - time.time()))
+        return not self.disabled and not self.over_budget()
 
 
 class KeyPool:
-    """Thread-safe round-robin pool with cooldown / exhaustion tracking."""
+    """Strict 1->2->3 rotation: new key every request, failover to next on error."""
 
     def __init__(self, keys: List[str]):
         self.keys: List[KeyState] = [KeyState(k) for k in keys]
-        self._counter = itertools.count()
+        self._pos = 0
         self._lock = asyncio.Lock()
 
     def reload(self, keys: List[str]):
@@ -101,43 +102,41 @@ class KeyPool:
     def size(self) -> int:
         return len(self.keys)
 
-    async def acquire(self) -> Optional[KeyState]:
-        """Return next available key (round-robin). None if all cooling down."""
+    async def next_key(self) -> Optional[KeyState]:
+        """Next key in strict rotation, skipping disabled / over-budget keys."""
         async with self._lock:
             n = len(self.keys)
             if n == 0:
                 return None
-            start = next(self._counter) % n
-            for i in range(n):
-                ks = self.keys[(start + i) % n]
+            for _ in range(n):
+                ks = self.keys[self._pos % n]
+                self._pos += 1
                 if ks.available:
                     return ks
             return None
 
-    async def mark_success(self, ks: KeyState):
+    async def mark_success(self, ks: KeyState, tokens: int = 0):
         async with self._lock:
             ks.success += 1
-            ks.fails = 0
+            ks.tokens_used += max(0, tokens)
 
-    async def mark_rate_limited(self, ks: KeyState):
+    async def add_usage(self, ks: KeyState, tokens: int):
+        async with self._lock:
+            ks.tokens_used += max(0, tokens)
+
+    async def mark_failed(self, ks: KeyState):
         async with self._lock:
             ks.fails += 1
-            ks.disabled_until = time.time() + COOLDOWN_RATE_LIMIT_SEC
-            ks.disabled_reason = f"429 rate-limit (cooldown {COOLDOWN_RATE_LIMIT_SEC}s)"
-
-    async def mark_exhausted(self, ks: KeyState, reason: str):
-        async with self._lock:
-            ks.fails += 1
-            ks.disabled_until = time.time() + COOLDOWN_EXHAUSTED_SEC
-            ks.disabled_reason = f"exhausted: {reason[:120]}"
 
     async def status(self):
         return [
             {
                 "key": ks.masked,
                 "available": ks.available,
-                "cooldown_left_sec": ks.cooldown_left(),
-                "reason": ks.disabled_reason,
+                "tokens_used": ks.tokens_used,
+                "limit": MAX_TOKENS_PER_KEY,
+                "over_budget": ks.over_budget(),
+                "disabled": ks.disabled,
                 "success": ks.success,
                 "fails": ks.fails,
             }
@@ -183,19 +182,18 @@ class KeyPool:
             if i is None:
                 return None
             ks = self.keys[i]
-            if enabled:
-                ks.disabled_until = 0
-                ks.disabled_reason = ""
-            else:
-                ks.disabled_until = time.time() + 24 * 3600
-                ks.disabled_reason = "manually disabled via Telegram"
+            ks.disabled = not enabled
             return ks.masked
 
-    async def reset_all(self):
+    async def reset_usage(self):
+        """Zero token counters + fail counts (budgets restart)."""
         async with self._lock:
             for ks in self.keys:
-                ks.disabled_until = 0
-                ks.disabled_reason = ""
+                ks.tokens_used = 0
+                ks.fails = 0
+
+    async def reset_all(self):
+        await self.reset_usage()
 
 
 pool = KeyPool(load_keys_list())
@@ -208,13 +206,37 @@ if not Path(KEYS_FILE).exists() and pool.size:
 tg_app = None  # telegram Application, set in lifespan when enabled
 
 
-def set_cooldowns(rate_sec: Optional[int] = None, exhausted_sec: Optional[int] = None):
-    global COOLDOWN_RATE_LIMIT_SEC, COOLDOWN_EXHAUSTED_SEC
-    if rate_sec is not None:
-        COOLDOWN_RATE_LIMIT_SEC = max(1, rate_sec)
-    if exhausted_sec is not None:
-        COOLDOWN_EXHAUSTED_SEC = max(60, exhausted_sec)
-    return COOLDOWN_RATE_LIMIT_SEC, COOLDOWN_EXHAUSTED_SEC
+def set_token_limit(n: int) -> int:
+    global MAX_TOKENS_PER_KEY
+    MAX_TOKENS_PER_KEY = max(0, n)
+    return MAX_TOKENS_PER_KEY
+
+
+def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> int:
+    """Real usage.total_tokens when upstream reports it, else chars // 4 estimate."""
+    if isinstance(data, dict):
+        u = data.get("usage") or {}
+        if isinstance(u, dict):
+            total = u.get("total_tokens")
+            if isinstance(total, int) and total > 0:
+                return total
+            p = u.get("prompt_tokens", 0) or 0
+            c = u.get("completion_tokens", 0) or 0
+            if p or c:
+                return int(p) + int(c)
+    return (len(req_body) + len(resp_body)) // 4 or 1
+
+
+def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> int:
+    """Usage chunk sometimes carries total_tokens at stream end; else estimate."""
+    try:
+        import re
+        m = re.search(rb'"total_tokens"\s*:\s*(\d+)', stream_bytes)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return (len(req_body) + len(stream_bytes)) // 4 or 1
 
 
 @asynccontextmanager
@@ -243,7 +265,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.2.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -305,7 +327,7 @@ async def root():
 
 
 async def proxy_request(request: Request):
-    """Forward to upstream, rotating keys on 402/429/401/5xx. Supports SSE streaming."""
+    """Strict 1->2->3 rotation + preemptive token budgets. Supports SSE streaming."""
     if pool.size == 0:
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
@@ -324,11 +346,11 @@ async def proxy_request(request: Request):
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
-            ks = await pool.acquire()
+            ks = await pool.next_key()
             if ks is None:
                 raise HTTPException(
                     status_code=503,
-                    detail="All API keys are cooling down / exhausted. Try later or add keys.",
+                    detail="All API keys over token budget or disabled. /resetusage or add keys.",
                 )
             tried += 1
             try:
@@ -340,40 +362,42 @@ async def proxy_request(request: Request):
                 )
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
-                await pool.mark_rate_limited(ks)  # short cooldown, try next
-                continue
+                await pool.mark_failed(ks)
+                continue  # next key in sequence
 
             ctype = resp.headers.get("content-type", "")
 
-            # Success -> return (stream if SSE)
+            # Success -> return (stream if SSE), record tokens
             if resp.status_code < 400:
-                await pool.mark_success(ks)
                 if "text/event-stream" in ctype:
-                    async def gen():
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                    return StreamingResponse(gen(), status_code=resp.status_code, media_type=ctype)
-                return JSONResponse(status_code=resp.status_code, content=resp.json() if resp.content else {})
+                    await pool.mark_success(ks)
+                    raw = resp.content if hasattr(resp, "content") else b""
 
-            # Failure -> decide rotate or return
+                    async def gen():
+                        buf = bytearray()
+                        async for chunk in resp.aiter_bytes():
+                            buf.extend(chunk)
+                            yield chunk
+                        await pool.add_usage(ks, count_stream_tokens(body, bytes(buf)))
+
+                    return StreamingResponse(gen(), status_code=resp.status_code, media_type=ctype)
+                data = resp.json() if resp.content else {}
+                await pool.mark_success(ks, count_tokens(body, resp.content, data))
+                return JSONResponse(status_code=resp.status_code, content=data)
+
+            # Failure -> next key in sequence (no cooldowns)
             try:
                 text = resp.text[:2000]
             except Exception:
                 text = ""
             last_error = f"{ks.masked} -> {resp.status_code}: {text[:300]}"
             last_status = resp.status_code
+            await pool.mark_failed(ks)
 
-            if resp.status_code == 429:
-                await pool.mark_rate_limited(ks)
-                continue  # always rotate on rate limit
-            if is_exhausted(resp.status_code, text):
-                await pool.mark_exhausted(ks, f"{resp.status_code} {text[:150]}")
-                continue  # rotate to next key
-            if resp.status_code >= 500:
-                await pool.mark_rate_limited(ks)
-                continue  # upstream blip, try next key
+            if resp.status_code in (429, 500, 502, 503, 504) or is_exhausted(resp.status_code, text):
+                continue  # rate-limit / dead key / blip -> next key
 
-            # Real client error (400, 404, 422...) -> don't rotate, return as-is
+            # Real client error (400, 404, 422...) -> don't rotate further, return as-is
             return JSONResponse(status_code=resp.status_code, content={"error": text, "proxy_note": params_note})
 
     raise HTTPException(status_code=last_status if last_status != 502 else 503,
