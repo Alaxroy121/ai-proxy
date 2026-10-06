@@ -114,8 +114,15 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
+    import app as appmod
     pool = ctx.bot_data["pool"]
-    await update.message.reply_text("🔑 *keys*\n" + "\n".join(_stats_lines(pool)), parse_mode="Markdown")
+    total = len(pool.keys)
+    used = sum(k.tokens_used for k in pool.keys)
+    lim = appmod.MAX_TOKENS_PER_KEY
+    overall = _bar(used, lim * total) if lim else f"`{used:,}` (no limit)"
+    await update.message.reply_text(
+        f"📊 *overall* {overall}\n\n🔑 *per key*\n" + "\n".join(_stats_lines(pool)),
+        parse_mode="Markdown")
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

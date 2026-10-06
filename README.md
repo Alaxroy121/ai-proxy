@@ -60,7 +60,7 @@ Setup (2 min):
 
 DM commands:
 - `/health` - upstream + keys in rotation + tokens used
-- `/stats` - per-key usage `used/limit` (masked keys only, never full)
+- `/stats` - overall total bar + per-key usage bars (masked keys only)
 - `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
 - `/rm <num>` - remove key by number from `/stats`

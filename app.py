@@ -299,12 +299,19 @@ def build_upstream_headers(incoming: Request, api_key: str) -> dict:
 async def health():
     st = await pool.status()
     avail = sum(1 for s in st if s["available"])
-    return {"ok": True, "upstream": UPSTREAM_BASE_URL, "keys_total": len(st), "keys_available": avail}
+    used = sum(s["tokens_used"] for s in st)
+    cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
+    return {"ok": True, "upstream": UPSTREAM_BASE_URL, "keys_total": len(st),
+            "keys_available": avail, "tokens_used_total": used,
+            "tokens_capacity_total": cap}
 
 
 @app.get("/keys/status")
 async def keys_status(_=Depends(check_proxy_auth)):
-    return {"keys": await pool.status()}
+    st = await pool.status()
+    used = sum(s["tokens_used"] for s in st)
+    cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
+    return {"overall": {"tokens_used": used, "capacity": cap}, "keys": st}
 
 
 @app.post("/keys/reload")
