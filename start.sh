@@ -1,7 +1,7 @@
 #!/bin/bash
 # AI key-rotating proxy - start/stop script (no Docker needed)
 # Usage: ./start.sh [start|stop|restart|status|logs]
-set -euo pipefail
+set -eu
 cd "$(dirname "$0")"
 
 VENV=".venv"
