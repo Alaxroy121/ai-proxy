@@ -12,6 +12,8 @@ the provider can rate-limit or error.
 - If a key errors (402/401/429/5xx), the same request retries with the next key
 - Token counting: real `usage.total_tokens` when upstream reports it,
   otherwise estimated as chars ÷ 4. Budgets reset on restart or `/resetusage`
+- Streaming holds its own upstream connection, so long generations never
+  get cut mid-response (each request still uses one key: 1→2→3…)
 
 ## Run on VPS (no Docker)
 

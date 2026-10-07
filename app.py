@@ -4,6 +4,7 @@ Strict 1->2->3 rotation (new key every request) + preemptive per-key
 token budgets: switch BEFORE the provider errors.
 """
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -335,7 +336,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.3.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -353,6 +354,21 @@ def is_exhausted(status_code: int, body_text: str) -> bool:
         return True  # invalid key / no credits -> rotate anyway
     low = body_text.lower()
     return any(m in low for m in EXHAUSTED_MARKERS)
+
+
+def _retryable(status_code: int, body_text: str) -> bool:
+    return status_code in (429, 500, 502, 503, 504) or is_exhausted(status_code, body_text)
+
+
+def _wants_stream(request: Request, body: bytes) -> bool:
+    if body:
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and data.get("stream") is True:
+                return True
+        except Exception:
+            pass
+    return "text/event-stream" in request.headers.get("accept", "").lower()
 
 
 def build_upstream_headers(incoming: Request, api_key: str) -> dict:
@@ -420,6 +436,7 @@ async def proxy_request(request: Request):
     last_status: int = 502
     tried = 0
     max_tries = min(MAX_RETRIES_PER_REQUEST, pool.size * 2)
+    want_stream = _wants_stream(request, body)
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
@@ -430,12 +447,60 @@ async def proxy_request(request: Request):
                     detail="All API keys over token budget or disabled. /resetusage or add keys.",
                 )
             tried += 1
+            headers = build_upstream_headers(request, ks.key)
+
+            if want_stream:
+                # Streaming needs its OWN client owned by the generator below.
+                # The shared client above closes when this function returns,
+                # which used to cut streams mid-response (interruptions).
+                sclient = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC)
+                try:
+                    sreq = sclient.build_request(request.method, upstream_url, content=body, headers=headers)
+                    sresp = await sclient.send(sreq, stream=True)
+                except httpx.RequestError as e:
+                    await sclient.aclose()
+                    last_error = f"network error with {ks.masked}: {e}"
+                    await pool.mark_failed(ks)
+                    continue  # next key in sequence
+                if sresp.status_code >= 400:
+                    raw = await sresp.aread()
+                    await sresp.aclose()
+                    await sclient.aclose()
+                    try:
+                        text = raw[:2000].decode("utf-8", errors="replace")
+                    except Exception:
+                        text = ""
+                    last_error = f"{ks.masked} -> {sresp.status_code}: {text[:300]}"
+                    last_status = sresp.status_code
+                    await pool.mark_failed(ks)
+                    if _retryable(sresp.status_code, text):
+                        continue  # rate-limit / dead key / blip -> next key
+                    return JSONResponse(status_code=sresp.status_code,
+                                        content={"error": text, "proxy_note": params_note})
+                await pool.mark_success(ks)
+
+                async def gen(_r=sresp, _c=sclient, _k=ks):
+                    buf = bytearray()
+                    try:
+                        async for chunk in _r.aiter_bytes():
+                            buf.extend(chunk)
+                            yield chunk
+                    finally:
+                        try:
+                            await _r.aclose()
+                        finally:
+                            await _c.aclose()
+                        await pool.add_usage(_k, count_stream_tokens(body, bytes(buf)))
+
+                return StreamingResponse(gen(), status_code=sresp.status_code,
+                                         media_type="text/event-stream")
+
             try:
                 resp = await client.request(
                     request.method,
                     upstream_url,
                     content=body,
-                    headers=build_upstream_headers(request, ks.key),
+                    headers=headers,
                 )
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
@@ -444,19 +509,8 @@ async def proxy_request(request: Request):
 
             ctype = resp.headers.get("content-type", "")
 
-            # Success -> return (stream if SSE), record tokens
+            # Success -> record tokens, return JSON
             if resp.status_code < 400:
-                if "text/event-stream" in ctype:
-                    await pool.mark_success(ks)
-
-                    async def gen():
-                        buf = bytearray()
-                        async for chunk in resp.aiter_bytes():
-                            buf.extend(chunk)
-                            yield chunk
-                        await pool.add_usage(ks, count_stream_tokens(body, bytes(buf)))
-
-                    return StreamingResponse(gen(), status_code=resp.status_code, media_type=ctype)
                 data = resp.json() if resp.content else {}
                 await pool.mark_success(ks, count_tokens(body, resp.content, data))
                 return JSONResponse(status_code=resp.status_code, content=data)
@@ -470,7 +524,7 @@ async def proxy_request(request: Request):
             last_status = resp.status_code
             await pool.mark_failed(ks)
 
-            if resp.status_code in (429, 500, 502, 503, 504) or is_exhausted(resp.status_code, text):
+            if _retryable(resp.status_code, text):
                 continue  # rate-limit / dead key / blip -> next key
 
             # Real client error (400, 404, 422...) -> don't rotate further, return as-is
