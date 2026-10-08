@@ -1,7 +1,8 @@
 """
 AI API rotating proxy - OpenRouter / any OpenAI-compatible upstream.
-Strict 1->2->3 rotation (new key every request) + preemptive per-key
-token budgets: switch BEFORE the provider errors.
+Fill-then-shift: use one key until its budget is full, then shift to
+the next key. Preemptive per-key token budgets: switch BEFORE the
+provider errors.
 """
 import asyncio
 import json
@@ -87,11 +88,11 @@ class KeyState:
 
 
 class KeyPool:
-    """Strict 1->2->3 rotation: new key every request, failover to next on error."""
+    """Fill-then-shift: stick to one key until its budget is full, then shift."""
 
     def __init__(self, keys: List[str]):
         self.keys: List[KeyState] = [KeyState(k) for k in keys]
-        self._pos = 0
+        self._current = 0
         self._lock = asyncio.Lock()
         self.store = None  # attached in lifespan (file or mongo)
 
@@ -100,25 +101,39 @@ class KeyPool:
             # keep stats for existing keys, add new ones
             existing = {k.key: k for k in self.keys}
             self.keys = [existing.get(k, KeyState(k)) for k in keys]
-            self._pos = 0
+            self._current = 0
         await self._persist_keys()
 
     @property
     def size(self) -> int:
         return len(self.keys)
 
+    async def _scan_locked(self) -> Optional[KeyState]:
+        """First available key from _current onward (caller holds the lock)."""
+        n = len(self.keys)
+        if n == 0:
+            return None
+        for i in range(n):
+            ks = self.keys[(self._current + i) % n]
+            if ks.available:
+                self._current = (self._current + i) % n
+                return ks
+        return None
+
     async def next_key(self) -> Optional[KeyState]:
-        """Next key in strict rotation, skipping disabled / over-budget keys."""
+        """Current key until its budget is full, then shift to the next one."""
+        async with self._lock:
+            return await self._scan_locked()
+
+    async def advance_past(self, bad: KeyState) -> Optional[KeyState]:
+        """Skip a just-failed key and shift to the next available one."""
         async with self._lock:
             n = len(self.keys)
-            if n == 0:
-                return None
-            for _ in range(n):
-                ks = self.keys[self._pos % n]
-                self._pos += 1
-                if ks.available:
-                    return ks
-            return None
+            for i, ks in enumerate(self.keys):
+                if ks is bad:
+                    self._current = (i + 1) % n
+                    break
+            return await self._scan_locked()
 
     async def mark_success(self, ks: KeyState, tokens: int = 0):
         async with self._lock:
@@ -336,7 +351,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.4.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -461,7 +476,8 @@ async def proxy_request(request: Request):
                     await sclient.aclose()
                     last_error = f"network error with {ks.masked}: {e}"
                     await pool.mark_failed(ks)
-                    continue  # next key in sequence
+                    await pool.advance_past(ks)
+                    continue  # shift to next key
                 if sresp.status_code >= 400:
                     raw = await sresp.aread()
                     await sresp.aclose()
@@ -474,7 +490,8 @@ async def proxy_request(request: Request):
                     last_status = sresp.status_code
                     await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
-                        continue  # rate-limit / dead key / blip -> next key
+                        await pool.advance_past(ks)
+                        continue  # rate-limit / dead key / blip -> shift to next key
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
                 await pool.mark_success(ks)
@@ -505,7 +522,8 @@ async def proxy_request(request: Request):
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
                 await pool.mark_failed(ks)
-                continue  # next key in sequence
+                await pool.advance_past(ks)
+                continue  # shift to next key
 
             ctype = resp.headers.get("content-type", "")
 
@@ -525,7 +543,8 @@ async def proxy_request(request: Request):
             await pool.mark_failed(ks)
 
             if _retryable(resp.status_code, text):
-                continue  # rate-limit / dead key / blip -> next key
+                await pool.advance_past(ks)
+                continue  # rate-limit / dead key / blip -> shift to next key
 
             # Real client error (400, 404, 422...) -> don't rotate further, return as-is
             return JSONResponse(status_code=resp.status_code, content={"error": text, "proxy_note": params_note})

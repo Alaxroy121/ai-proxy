@@ -1,19 +1,19 @@
 # AI Key-Rotating Proxy (OpenRouter / OpenAI-compatible)
 
-Strict 1→2→3 rotation + preemptive token budgets. A new key is used for
-every request; a key that reaches `MAX_TOKENS_PER_KEY` is skipped BEFORE
-the provider can rate-limit or error.
+Strict 1→2→3 rotation + preemptive token budgets. One key serves every
+request until its `MAX_TOKENS_PER_KEY` budget is full — then traffic
+shifts to the next key. A key that errors is skipped the same way.
 
 ## How it works
 - You give it N keys: `API_KEYS=key1,key2,key3`
 - Clients call **the proxy** instead of the provider directly:
   `POST http://YOUR-VPS:25007/v1/chat/completions`
-- Request 1 → key1, request 2 → key2, request 3 → key3, request 4 → key1…
+- All requests → key1 until key1's budget is full → all requests → key2 …
 - If a key errors (402/401/429/5xx), the same request retries with the next key
 - Token counting: real `usage.total_tokens` when upstream reports it,
   otherwise estimated as chars ÷ 4. Budgets reset on restart or `/resetusage`
 - Streaming holds its own upstream connection, so long generations never
-  get cut mid-response (each request still uses one key: 1→2→3…)
+  get cut mid-response (each request still uses the current key)
 
 ## Run on VPS (no Docker)
 

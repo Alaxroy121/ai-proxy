@@ -102,7 +102,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await _deny(update)
     await update.message.reply_text(
         "🤖 *Proxy control panel*\n"
-        "Strict 1→2→3 rotation + per-key budgets.\n"
+        "Fill-then-shift: one key until its budget is full.\n"
         "📈 Live progress auto-pushes at 50/80/100%.",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
@@ -130,7 +130,7 @@ def render_config(pool=None) -> str:
     return (
         "⚙️ *config*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
-        f"mode: strict 1→2→3 rotation (new key every request)\n"
+        f"mode: fill key 1 to budget, then shift to key 2, …\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"live milestones: `50/80/100%`\n"
         f"auto digest: `{os.getenv('LIVE_DIGEST_MIN', '0')} min (0 = off)`\n"
