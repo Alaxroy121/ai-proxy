@@ -331,15 +331,35 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init(app: Application):
+    """Initialize bot commands in Telegram menu."""
     from telegram import BotCommand
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    
+    if not token:
+        print("[telegram] ERROR: TELEGRAM_BOT_TOKEN not set in environment!")
+        return
+    
     try:
-        await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMAND_MENU])
+        # Convert COMMAND_MENU to BotCommand objects
+        commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
+        
+        # Set commands for default scope (private chats)
+        await app.bot.set_my_commands(commands)
+        print(f"[telegram] ✅ Commands registered successfully with Telegram")
+        print(f"[telegram] Command list: {[c.command for c in commands]}")
+        
     except Exception as e:
-        print(f"[telegram] menu set failed: {e}")
+        print(f"[telegram] ❌ FAILED to register commands: {e}")
+        print(f"[telegram] Token valid: {bool(token)}")
+        print(f"[telegram] Make sure bot token is correct and bot can access Telegram API")
 
 
 def build_bot_app(pool) -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+    
     app = Application.builder().token(token).post_init(_post_init).build()
     app.bot_data["pool"] = pool
     app.add_handler(CallbackQueryHandler(on_button))
