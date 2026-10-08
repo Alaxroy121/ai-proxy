@@ -10,8 +10,9 @@ shifts to the next key. A key that errors is skipped the same way.
   `POST http://YOUR-VPS:25007/v1/chat/completions`
 - All requests → key1 until key1's budget is full → all requests → key2 …
 - If a key errors (402/401/429/5xx), the same request retries with the next key
-- Token counting: real `usage.total_tokens` when upstream reports it,
-  otherwise estimated as chars ÷ 4. Budgets reset on restart or `/resetusage`
+- Token counting: real `usage.total_tokens` when upstream reports it
+  (streaming requests auto-add `stream_options.include_usage` so stream
+  counts are exact too), otherwise estimated as chars ÷ 4.
 - Streaming holds its own upstream connection, so long generations never
   get cut mid-response (each request still uses the current key)
 
@@ -22,6 +23,8 @@ cd ai-proxy
 ./start.sh          # first run creates .env - edit it, then run again
 # edit .env, put your keys
 ./start.sh          # installs deps + starts in background
+# Or one command (from this folder, reads PORT from .env):
+python -m ai_proxy
 ./start.sh status   # check health
 ./start.sh logs     # tail logs
 ./start.sh restart  # after editing .env

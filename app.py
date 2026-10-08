@@ -465,12 +465,26 @@ async def proxy_request(request: Request):
             headers = build_upstream_headers(request, ks.key)
 
             if want_stream:
+                # Ask upstream for exact token counts in the stream itself
+                # (OpenAI-style `include_usage`), so budgets stay accurate.
+                body_out = body
+                if upstream_path == "/v1/chat/completions":
+                    try:
+                        payload = json.loads(body) if body else {}
+                        if isinstance(payload, dict):
+                            so = payload.get("stream_options") or {}
+                            if isinstance(so, dict) and "include_usage" not in so:
+                                so["include_usage"] = True
+                                payload["stream_options"] = so
+                                body_out = json.dumps(payload).encode()
+                    except Exception:
+                        body_out = body
                 # Streaming needs its OWN client owned by the generator below.
                 # The shared client above closes when this function returns,
                 # which used to cut streams mid-response (interruptions).
                 sclient = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC)
                 try:
-                    sreq = sclient.build_request(request.method, upstream_url, content=body, headers=headers)
+                    sreq = sclient.build_request(request.method, upstream_url, content=body_out, headers=headers)
                     sresp = await sclient.send(sreq, stream=True)
                 except httpx.RequestError as e:
                     await sclient.aclose()
@@ -496,7 +510,7 @@ async def proxy_request(request: Request):
                                         content={"error": text, "proxy_note": params_note})
                 await pool.mark_success(ks)
 
-                async def gen(_r=sresp, _c=sclient, _k=ks):
+                async def gen(_r=sresp, _c=sclient, _k=ks, _b=body_out):
                     buf = bytearray()
                     try:
                         async for chunk in _r.aiter_bytes():
@@ -507,7 +521,7 @@ async def proxy_request(request: Request):
                             await _r.aclose()
                         finally:
                             await _c.aclose()
-                        await pool.add_usage(_k, count_stream_tokens(body, bytes(buf)))
+                        await pool.add_usage(_k, count_stream_tokens(_b, bytes(buf)))
 
                 return StreamingResponse(gen(), status_code=sresp.status_code,
                                          media_type="text/event-stream")
