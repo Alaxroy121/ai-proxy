@@ -19,6 +19,7 @@ shifts to the next key. A key that errors is skipped the same way.
 - Usage is crash-safe: memory counters are exact, deltas queue in a local
   write-ahead log + flush to the store every few seconds (and on shutdown),
   so a restart loses at most seconds of data — never hours
+- Token displays are compact: `13.8m`, `500k`, `950` (API keeps raw ints)
 - Streaming holds its own upstream connection, so long generations never
   get cut mid-response (each request still uses the current key)
 
@@ -109,6 +110,9 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/sites` - list upstream websites (V1, V2, …)
 - `/siteadd <url>` / `/siteuse <V2>` / `/siterm <V1>` - manage websites live
   (clients can also pin one request via `X-Site: V2` header)
+- `/sitereset <V1> <hours>` - auto-zero that website's counters every N
+  hours (`0` = off). Each provider resets billing on its own cycle —
+  match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.
 - Keys belong to one website: `/add <key> [V2]` (default: active site).
   Traffic on V1 only spends V1 keys. `/stats [V2]` filters by site.
   A site can't be removed while keys point at it — `/rm` them first.

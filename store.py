@@ -104,7 +104,7 @@ class FileStore:
                          token_limit: Optional[int] = None, req_limit: Optional[int] = None):
         return False  # counters live in memory in file mode
 
-    async def reset_usage(self):
+    async def reset_usage(self, site_id: Optional[str] = None):
         return None  # nothing durable in file mode
 
     async def load_meta(self, name: str) -> Optional[Dict[str, Any]]:
@@ -211,9 +211,10 @@ class MongoStore:
         await self.col.update_one({"_id": key}, update, upsert=True)
         return True
 
-    async def reset_usage(self):
-        await self.col.update_many({}, {"$set": {"tokens_used": 0, "cached_tokens": 0,
-                                                "success": 0, "fails": 0, "req_used": 0}})
+    async def reset_usage(self, site_id: Optional[str] = None):
+        filt = {"site": site_id} if site_id else {}
+        await self.col.update_many(filt, {"$set": {"tokens_used": 0, "cached_tokens": 0,
+                                                  "success": 0, "fails": 0, "req_used": 0}})
 
     async def load_meta(self, name: str) -> Optional[Dict[str, Any]]:
         return await self.col.database["proxy_meta"].find_one({"_id": name})

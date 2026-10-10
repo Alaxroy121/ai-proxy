@@ -31,6 +31,7 @@ COMMAND_MENU = [
     ("sites", "List upstream websites V1, V2…"),
     ("siteadd", "Add website: /siteadd <url>"),
     ("siteuse", "Switch website: /siteuse <V1>"),
+    ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
     ("siterm", "Remove website: /siterm <V1>"),
     ("add", "Add a key: /add <key> [V1]"),
     ("limit", "Token budget per key: /limit <num> <n>"),
@@ -50,6 +51,7 @@ HELP_TEXT = (
     "/sites – list websites (V1, V2…)\n"
     "/siteadd <url> – add website\n"
     "/siteuse <V1> – switch active website\n"
+    "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
     "/siterm <V1> – remove website\n"
     "/add <full-key> [V1] – add key to a website (default: active)\n"
     "/limit <num> <tokens> – token budget for one key (0 = global)\n"
@@ -78,7 +80,7 @@ def panel_text(pool) -> str:
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     cap = sum(k.eff_token_limit() for k in pool.keys)
-    overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+    overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
     return (
         "🤖 *Proxy control panel*\n"
         "Fill-then-shift: one key until its budget is full.\n"
@@ -159,10 +161,19 @@ RESET_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
 
 async def render_sites() -> str:
     import app as appmod
+    import time
     lines = []
     for s in await appmod.sites.list_sites():
         mark = "🟢 active" if s.get("active") else "⚪"
-        lines.append(f"`{s['id']}` {mark} `{s['url']}`")
+        rh = s.get("reset_hours") or 0
+        if rh > 0:
+            left = max(0, rh * 3600 - (time.time() - (s.get("last_reset") or 0)))
+            hrs = int(left // 3600)
+            mins = int((left % 3600) // 60)
+            sched = f" 🔁 {rh:g}h (next ~{hrs}h{mins:02d}m)"
+        else:
+            sched = ""
+        lines.append(f"`{s['id']}` {mark} `{s['url']}`{sched}")
     return "🌐 *websites*\n" + "\n".join(lines or ["(none)"]) + "\n\nTap a button to switch."
 
 
@@ -182,13 +193,23 @@ async def _deny(update: Update):
         await update.message.reply_text("⛔ Not authorized. Your ID is not in TELEGRAM_ADMIN_IDS.")
 
 
+def _fmt(n: int) -> str:
+    """Compact token counts: 950 -> 950, 12,400 -> 12.4k, 13,808,000 -> 13.8m."""
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "m"
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + "k"
+    return f"{n:,}"
+
+
 def _bar(used: int, limit: int, width: int = 12) -> str:
     """Unique progress style: ▰ filled, ▱ empty, clamped, with %."""
     if limit <= 0:
-        return f"`{used:,}` (no limit)"
+        return f"`{_fmt(used)}` (no limit)"
     pct = min(100, int(used * 100 / limit))
     fill = min(width, int(used * width / limit))
-    return f"`{'▰' * fill}{'▱' * (width - fill)}` {pct}% ({used:,}/{limit:,})"
+    return f"`{'▰' * fill}{'▱' * (width - fill)}` {pct}% ({_fmt(used)}/{_fmt(limit)})"
 
 
 def _stats_lines(items) -> list[str]:
@@ -203,9 +224,9 @@ def _stats_lines(items) -> list[str]:
             state, extra = "✅", "in rotation"
         bits = f"{_bar(ks.tokens_used, ks.eff_token_limit())} ok={ks.success} fail={ks.fails}"
         if ks.cached_tokens:
-            bits += f" ({ks.cached_tokens:,} cached)"
+            bits += f" ({_fmt(ks.cached_tokens)} cached)"
         if ks.token_limit:
-            bits += f" [lim {ks.token_limit:,}]"
+            bits += f" [lim {_fmt(ks.token_limit)}]"
         if ks.req_limit:
             bits += f" [req {ks.req_used:,}/{ks.req_limit:,}]"
         elif ks.req_used:
@@ -258,13 +279,13 @@ def render_stats(pool, site_filter=None) -> str:
             title = f"{mark} *{sid}* `{appmod.sites.resolve(sid) or '?'}`"
         used = sum(ks.tokens_used for _, ks in items)
         cap = sum(ks.eff_token_limit() for _, ks in items)
-        overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+        overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
         sections.append(f"{title}\n📊 overall ({sid}) {overall}\n" + "\n".join(_stats_lines(items)))
     body = "\n\n".join(sections) or "(no keys on this site)"
     if site_filter is None:
         all_used = sum(k.tokens_used for k in pool.keys)
         all_cap = sum(k.eff_token_limit() for k in pool.keys)
-        grand = _bar(all_used, all_cap) if all_cap else f"`{all_used:,}` (no limit)"
+        grand = _bar(all_used, all_cap) if all_cap else f"`{_fmt(all_used)}` (no limit)"
         body = f"🌍 *overall (all sites)* {grand}\n\n" + body
     if pool.pending_count() and site_filter is None:
         body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
@@ -385,7 +406,7 @@ def _make_health(pool):
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     cap = sum(k.eff_token_limit() for k in pool.keys)
-    budget = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+    budget = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
     pend = pool.pending_count()
     extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     return (
@@ -529,6 +550,42 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown, active, or last).")
 
 
+async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2:
+        return await update.message.reply_text("Usage: /sitereset <V1> <hours>  e.g. /sitereset V1 24 (0 = off)")
+    try:
+        hours = float(ctx.args[1])
+    except ValueError:
+        return await update.message.reply_text("❓ Hours must be a number.")
+    import app as appmod
+    ok = await appmod.sites.set_reset(ctx.args[0], hours)
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.")
+    msg = f"🔁 `{ctx.args[0].upper()}` auto-resets every `{hours:g}h`." if hours > 0 else \
+        f"🔁 Auto-reset off for `{ctx.args[0].upper()}`."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def site_reset_watch(ctx: ContextTypes.DEFAULT_TYPE):
+    """Zero per-website counters when their reset schedule is due."""
+    import app as appmod
+    pool = ctx.bot_data["pool"]
+    for sid in appmod.sites.due_sites():
+        await pool.reset_usage(sid)
+        await appmod.sites.stamp_reset(sid)
+        ms = ctx.bot_data.get("ms", {})
+        for ks in pool.keys:
+            if ks.site == sid:
+                ms.pop(ks.masked, None)
+        for aid in _admin_ids():
+            try:
+                await ctx.bot.send_message(int(aid), f"🔁 `{sid}` usage auto-reset (schedule due).", parse_mode="Markdown")
+            except Exception:
+                pass
+
+
 def _pct(used: int, limit: int) -> int:
     return min(100, int(used * 100 / limit)) if limit > 0 else 0
 
@@ -594,7 +651,7 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
         was = prev.get(masked, False)
         if out and not was:
             ks = next((k for k in pool.keys if k.masked == masked), None)
-            why = "disabled" if ks and ks.disabled else f"budget hit ({ks.tokens_used:,} tokens)"
+            why = "disabled" if ks and ks.disabled else f"budget hit ({_fmt(ks.tokens_used)} tokens)"
             for aid in _admin_ids():
                 try:
                     await ctx.bot.send_message(int(aid), f"⚠️ Key out: `{masked}`\n{why}", parse_mode="Markdown")
@@ -711,9 +768,11 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("sites", cmd_sites))
     app.add_handler(CommandHandler("siteadd", cmd_siteadd))
     app.add_handler(CommandHandler("siteuse", cmd_siteuse))
+    app.add_handler(CommandHandler("sitereset", cmd_sitereset))
     app.add_handler(CommandHandler("siterm", cmd_siterm))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
         app.job_queue.run_repeating(live_progress, interval=30, first=15)
+        app.job_queue.run_repeating(site_reset_watch, interval=60, first=30)
         app.job_queue.run_once(_resync_menu, when=60)
     return app

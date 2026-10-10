@@ -339,18 +339,22 @@ class KeyPool:
         self.outbox.add(ks.key, disabled=off)
         return masked
 
-    async def reset_usage(self):
-        """Zero token/cached/request counters + fail counts (budgets restart)."""
+    async def reset_usage(self, site_id: Optional[str] = None):
+        """Zero counters globally, or for one website only."""
         async with self._lock:
             for ks in self.keys:
+                if site_id is not None and ks.site != site_id:
+                    continue
                 ks.tokens_used = 0
                 ks.cached_tokens = 0
                 ks.req_used = 0
                 ks.fails = 0
-        self.outbox.drop()
+        for ks in list(self.keys):
+            if site_id is None or ks.site == site_id:
+                self.outbox.drop(ks.key)
         if self.store is not None:
             try:
-                await self.store.reset_usage()
+                await self.store.reset_usage(site_id)
             except Exception as e:
                 print(f"[store] reset failed: {e}")
 
@@ -437,7 +441,7 @@ class SiteManager:
     """Multiple upstream websites, each V1, V2, ... Telegram-switchable."""
 
     def __init__(self, default_url: str):
-        self.sites = [{"id": "V1", "url": default_url}]
+        self.sites = [{"id": "V1", "url": default_url, "reset_hours": 0, "last_reset": 0.0}]
         self.active_id = "V1"
         self.store = None
         self._lock = asyncio.Lock()
@@ -458,8 +462,16 @@ class SiteManager:
             return
         if not isinstance(doc, dict) or not doc.get("sites"):
             return
-        valid = [s for s in doc["sites"]
-                 if isinstance(s, dict) and s.get("id") and s.get("url", "").startswith("http")]
+        valid = []
+        for s in doc["sites"]:
+            if not isinstance(s, dict) or not s.get("id"):
+                continue
+            url = s.get("url", "")
+            if not url.startswith("http"):
+                continue
+            valid.append({"id": s["id"], "url": url.rstrip("/"),
+                          "reset_hours": float(s.get("reset_hours") or 0),
+                          "last_reset": float(s.get("last_reset") or 0)})
         if not valid:
             return
         async with self._lock:
@@ -488,7 +500,7 @@ class SiteManager:
             while any(s["id"] == f"V{n}" for s in self.sites):
                 n += 1
             nid = f"V{n}"
-            self.sites.append({"id": nid, "url": url})
+            self.sites.append({"id": nid, "url": url, "reset_hours": 0, "last_reset": 0.0})
         await self._save()
         return nid
 
@@ -500,6 +512,35 @@ class SiteManager:
             self.active_id = sid
         await self._save()
         return True
+
+    async def set_reset(self, sid: str, hours: float) -> bool:
+        """Auto-reset schedule for one website's counters (0 = off)."""
+        sid = self.norm(sid)
+        async with self._lock:
+            hit = next((s for s in self.sites if s["id"] == sid), None)
+            if hit is None:
+                return False
+            hit["reset_hours"] = max(0.0, hours)
+            import time
+            hit["last_reset"] = time.time()
+        await self._save()
+        return True
+
+    async def stamp_reset(self, sid: str):
+        import time
+        async with self._lock:
+            for s in self.sites:
+                if s["id"] == sid:
+                    s["last_reset"] = time.time()
+        await self._save()
+
+    def due_sites(self):
+        """Site IDs whose reset interval has elapsed."""
+        import time
+        now = time.time()
+        return [s["id"] for s in self.sites
+                if (s.get("reset_hours") or 0) > 0
+                and now - (s.get("last_reset") or 0) >= s["reset_hours"] * 3600]
 
     async def remove_site(self, sid: str) -> bool:
         sid = self.norm(sid)
