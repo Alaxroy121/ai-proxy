@@ -40,6 +40,7 @@ COMMAND_MENU = [
     ("enable", "Re-enable a key: /enable <num>"),
     ("disable", "Take a key offline: /disable <num>"),
     ("reset", "Zero all token counters"),
+    ("menu", "Re-sync the / command menu now"),
     ("help", "All commands"),
 ]
 
@@ -60,6 +61,7 @@ HELP_TEXT = (
     "/enable <num> – re-enable key\n"
     "/disable <num> – take key offline\n"
     "/reset – zero all token counters\n"
+    "/menu – force re-sync of this / menu\n"
     "📈 Live: auto-push at 50/80/100% per key."
 )
 
@@ -68,7 +70,8 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
      InlineKeyboardButton("❤️ Health", callback_data="health")],
     [InlineKeyboardButton("⚙️ Config", callback_data="config"),
      InlineKeyboardButton("🌐 Sites", callback_data="sites")],
-    [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
+    [InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+     InlineKeyboardButton("📋 Menu", callback_data="menu")],
 ])
 
 HOME_BUTTON = InlineKeyboardButton("🏠 Panel", callback_data="panel")
@@ -354,6 +357,12 @@ async def _route_button(data: str, pool, ctx):
         return render_config(pool), MAIN_KEYBOARD
     if data == "help":
         return HELP_TEXT, MAIN_KEYBOARD
+    if data == "menu":
+        ok, info = await sync_menu_now(ctx.bot)
+        if ok:
+            return (f"✅ Menu synced — `{info}` commands.\n"
+                    "Tap `/` to see them (reopen chat if cached)."), MAIN_KEYBOARD
+        return f"❌ Menu sync failed: `{info}`", MAIN_KEYBOARD
     if data == "sites":
         return await render_sites(), await sites_keyboard()
     if data == "refresh:stats":
@@ -690,38 +699,40 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
     ctx.bot_data["store_was_ok"] = ok
 
 
-async def _post_init(app: Application):
-    """Register the / command menu via setMyCommands (no @BotFather needed).
-
-    Retries on flaky networks, covers both Default and AllPrivateChats
-    scopes, verifies with getMyCommands, and pings admins on success.
-    """
+async def sync_menu_now(bot) -> tuple:
+    """Register the / menu via setMyCommands. Returns (ok, count_or_error)."""
     import asyncio
     from telegram import BotCommand, BotCommandScopeAllPrivateChats
+    commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
+    err = "unknown"
+    for attempt in range(1, 4):
+        try:
+            await bot.set_my_commands(commands)
+            try:
+                await bot.set_my_commands(
+                    commands, scope=BotCommandScopeAllPrivateChats())
+            except Exception as e:
+                print(f"[telegram] private-scope menu failed: {e}")
+            check = await bot.get_my_commands()
+            print(f"[telegram] menu registered: {len(check)} commands (attempt {attempt})")
+            print(f"[telegram] Command list: {[c.command for c in commands]}")
+            return True, len(check)
+        except Exception as e:
+            err = str(e)[:200]
+            print(f"[telegram] menu attempt {attempt} failed: {e}")
+            await asyncio.sleep(2 * attempt)
+    print("[telegram] menu registration failed after retries")
+    return False, err
+
+
+async def _post_init(app: Application):
+    """Register the / command menu via setMyCommands (no @BotFather needed)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("[telegram] ERROR: TELEGRAM_BOT_TOKEN not set in environment!")
         return
-    commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
-    ok = False
-    for attempt in range(1, 4):
-        try:
-            await app.bot.set_my_commands(commands)
-            try:
-                await app.bot.set_my_commands(
-                    commands, scope=BotCommandScopeAllPrivateChats())
-            except Exception as e:
-                print(f"[telegram] private-scope menu failed: {e}")
-            check = await app.bot.get_my_commands()
-            print(f"[telegram] menu registered: {len(check)} commands (attempt {attempt})")
-            print(f"[telegram] Command list: {[c.command for c in commands]}")
-            ok = True
-            break
-        except Exception as e:
-            print(f"[telegram] menu attempt {attempt} failed: {e}")
-            await asyncio.sleep(2 * attempt)
+    ok, _ = await sync_menu_now(app.bot)
     if not ok:
-        print("[telegram] menu registration failed after retries")
         return
     for aid in _admin_ids():
         try:
@@ -732,16 +743,26 @@ async def _post_init(app: Application):
 
 async def _resync_menu(ctx: ContextTypes.DEFAULT_TYPE):
     """Second-chance menu sync a minute after boot (unstable networks)."""
-    bot = ctx.bot
     try:
-        from telegram import BotCommand, BotCommandScopeAllPrivateChats
-        commands = [BotCommand(c, d) for c, d in COMMAND_MENU]
-        await bot.set_my_commands(commands)
-        await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-        check = await bot.get_my_commands()
-        print(f"[telegram] menu re-sync ok: {len(check)} commands")
+        ok, info = await sync_menu_now(ctx.bot)
+        if ok:
+            print(f"[telegram] menu re-sync ok: {info} commands")
     except Exception as e:
         print(f"[telegram] menu re-sync failed: {e}")
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    ok, info = await sync_menu_now(ctx.bot)
+    if ok:
+        await update.message.reply_text(
+            f"✅ Menu synced — `{info}` commands registered.\n"
+            "Tap `/` in this chat to see them. If they don't appear, "
+            "fully close + reopen the chat (Telegram caches menus).",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Menu sync failed: `{info}`\nPaste this to support.", parse_mode="Markdown")
 
 
 def build_bot_app(pool) -> Application:
@@ -763,6 +784,7 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("disable", cmd_disable))
     app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("limit", cmd_limit))
     app.add_handler(CommandHandler("reqlimit", cmd_reqlimit))
     app.add_handler(CommandHandler("sites", cmd_sites))
