@@ -5,3 +5,4 @@ pydantic>=2.10
 python-dotenv>=1.0
 python-telegram-bot[job-queue]>=21.6
 motor>=3.6  # only needed when MONGODB_URI is set
+anthropic>=0.40  # Anthropic SDK interop (clients + tests)

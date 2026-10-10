@@ -13,6 +13,12 @@ shifts to the next key. A key that errors is skipped the same way.
 - Token counting: real `usage.total_tokens` when upstream reports it
   (streaming requests auto-add `stream_options.include_usage` so stream
   counts are exact too), otherwise estimated as chars ÷ 4.
+  **Cached tokens count on top** (OpenAI details + Anthropic
+  cache_read/cache_creation), since platforms bill them.
+  Budgets reset on restart or `/resetusage`
+- Usage is crash-safe: memory counters are exact, deltas queue in a local
+  write-ahead log + flush to the store every few seconds (and on shutdown),
+  so a restart loses at most seconds of data — never hours
 - Streaming holds its own upstream connection, so long generations never
   get cut mid-response (each request still uses the current key)
 
@@ -48,6 +54,15 @@ print(c.chat.completions.create(model="openai/gpt-4o-mini",
   messages=[{"role":"user","content":"hi"}]).choices[0].message.content)
 ```
 
+Python (Anthropic SDK — keys rotate via `x-api-key`, same budgets apply):
+```python
+from anthropic import Anthropic
+c = Anthropic(base_url="http://YOUR-VPS:8000", api_key="PROXY_API_KEY")
+m = c.messages.create(model="your-upstream-model", max_tokens=100,
+    messages=[{"role": "user", "content": "hi"}])
+print(m.content[0].text)
+```
+
 ## Ops
 - `GET /health` - public
 - `GET /keys/status` - which key is live / cooling down
@@ -75,8 +90,14 @@ Setup (2 min):
 DM commands (also in the `/` menu + buttons under `/start`):
 - `/health` - upstream + keys in rotation + tokens used
 - `/stats` - overall total bar + per-key usage bars (masked keys only)
+- `/config` - budget, timeouts, upstream, store backend
+- `/sites` - list upstream websites (V1, V2, …)
+- `/siteadd <url>` / `/siteuse <V2>` / `/siterm <V1>` - manage websites live
+  (clients can also pin one request via `X-Site: V2` header)
 - `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
+- `/limit <num> <tokens>` - token budget for one key (`0` = global default)
+- `/reqlimit <num> <n>` - request-count budget for one key (`0` = unlimited)
 - `/rm <num>` - remove key by number from `/stats`
 - `/enable <num>` / `/disable <num>` - manual on/off
 - `/reset` - zero all token counters

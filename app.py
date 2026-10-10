@@ -10,7 +10,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -32,6 +32,8 @@ MAX_TOKENS_PER_KEY = int(os.getenv("MAX_TOKENS_PER_KEY", "0"))
 MAX_RETRIES_PER_REQUEST = int(os.getenv("MAX_RETRIES_PER_REQUEST", "10"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "120"))
 KEYS_FILE = os.getenv("KEYS_FILE", "keys.txt")  # one full key per line, persists Telegram-added keys
+USAGE_WAL = os.getenv("USAGE_WAL", "usage.wal")  # local write-ahead log for usage deltas
+FLUSH_SEC = int(os.getenv("FLUSH_SEC", "5"))  # outbox -> store interval
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_IDS = [s.strip() for s in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if s.strip()]
 
@@ -73,18 +75,94 @@ class KeyState:
     success: int = 0
     fails: int = 0
     tokens_used: int = 0
+    cached_tokens: int = 0
+    req_used: int = 0
+    req_limit: int = 0  # 0 = unlimited requests
+    token_limit: int = 0  # 0 = use global MAX_TOKENS_PER_KEY
     disabled: bool = False  # manual off via Telegram
 
     def __post_init__(self):
         k = self.key
         self.masked = f"{k[:7]}...{k[-4:]}" if len(k) > 12 else "***"
 
+    def eff_token_limit(self) -> int:
+        return self.token_limit if self.token_limit > 0 else MAX_TOKENS_PER_KEY
+
     def over_budget(self) -> bool:
-        return MAX_TOKENS_PER_KEY > 0 and self.tokens_used >= MAX_TOKENS_PER_KEY
+        tlim = self.eff_token_limit()
+        if tlim > 0 and self.tokens_used >= tlim:
+            return True
+        if self.req_limit > 0 and self.req_used >= self.req_limit:
+            return True
+        return False
 
     @property
     def available(self) -> bool:
         return not self.disabled and not self.over_budget()
+
+
+class Outbox:
+    """Usage deltas wait here (memory + local WAL) until flushed to the store.
+
+    Memory counters on KeyState are always exact; the store catches up every
+    FLUSH_SEC seconds. A crash loses at most one flush window (WAL replays
+    the rest on boot). Nothing here ever raises into request handling.
+    """
+
+    def __init__(self, wal):
+        self.wal = wal
+        self.pending: Dict[str, Dict[str, Any]] = {}
+        self.ops = 0
+
+    def add(self, key: str, tokens: int = 0, cached: int = 0, success: int = 0,
+            fails: int = 0, reqs: int = 0, disabled: Optional[bool] = None,
+            log: bool = True):
+        if not any((tokens, cached, success, fails, reqs)) and disabled is None:
+            return
+        entry = self.pending.setdefault(
+            key, {"tokens": 0, "cached": 0, "success": 0, "fails": 0, "reqs": 0,
+                  "disabled": None, "n": 0})
+        entry["tokens"] += tokens
+        entry["cached"] += cached
+        entry["success"] += success
+        entry["fails"] += fails
+        entry["reqs"] += reqs
+        if disabled is not None:
+            entry["disabled"] = disabled
+        entry["n"] += 1
+        self.ops += 1
+        if log:
+            self.wal.append({"key": key, "tokens": tokens, "cached": cached,
+                             "success": success, "fails": fails, "reqs": reqs})
+
+    def drop(self, key: Optional[str] = None):
+        if key is None:
+            self.pending = {}
+            self.ops = 0
+        elif key in self.pending:
+            self.ops -= self.pending.pop(key)["n"]
+
+    def depth(self) -> int:
+        return self.ops
+
+    async def flush(self, store) -> bool:
+        """Push coalesced deltas (one store write per key). True if all ok."""
+        if not self.pending:
+            return True
+        ok = True
+        for key, e in list(self.pending.items()):
+            try:
+                await store.update_key(key, tokens=e["tokens"], cached=e["cached"],
+                                       success=e["success"], fails=e["fails"],
+                                       reqs=e["reqs"], disabled=e["disabled"])
+                self.ops -= e["n"]
+                del self.pending[key]
+            except Exception as ex:
+                print(f"[outbox] flush {key} failed: {ex}")
+                ok = False
+        if ok:
+            self.wal.clear()  # everything durable -> log can go
+        return ok
 
 
 class KeyPool:
@@ -95,6 +173,11 @@ class KeyPool:
         self._current = 0
         self._lock = asyncio.Lock()
         self.store = None  # attached in lifespan (file or mongo)
+        from store import UsageWal
+        self.wal = UsageWal(USAGE_WAL)
+        self.outbox = Outbox(self.wal)
+        self.store_ok = True
+        self.last_store_error = ""
 
     async def reload(self, keys: List[str]):
         async with self._lock:
@@ -135,21 +218,55 @@ class KeyPool:
                     break
             return await self._scan_locked()
 
-    async def mark_success(self, ks: KeyState, tokens: int = 0):
+    async def mark_success(self, ks: KeyState, tokens: int = 0, cached: int = 0):
         async with self._lock:
             ks.success += 1
+            ks.req_used += 1
             ks.tokens_used += max(0, tokens)
-        await self._persist_one(ks, tokens=max(0, tokens), success=1)
+            ks.cached_tokens += max(0, cached)
+        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached),
+                        success=1, reqs=1)
 
-    async def add_usage(self, ks: KeyState, tokens: int):
+    async def add_usage(self, ks: KeyState, tokens: int, cached: int = 0):
         async with self._lock:
             ks.tokens_used += max(0, tokens)
-        await self._persist_one(ks, tokens=max(0, tokens))
+            ks.cached_tokens += max(0, cached)
+        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached))
 
     async def mark_failed(self, ks: KeyState):
         async with self._lock:
             ks.fails += 1
-        await self._persist_one(ks, fails=1)
+        self.outbox.add(ks.key, fails=1)
+
+    async def set_token_limit(self, ident: str, limit: int) -> Optional[str]:
+        """Per-key token budget (0 = fall back to global). Persists immediately."""
+        async with self._lock:
+            i = self._find_index(ident)
+            if i is None:
+                return None
+            self.keys[i].token_limit = max(0, limit)
+            full, masked = self.keys[i].key, self.keys[i].masked
+        if self.store is not None:
+            try:
+                await self.store.update_key(full, token_limit=max(0, limit))
+            except Exception as e:
+                print(f"[store] limit save failed: {e}")
+        return masked
+
+    async def set_req_limit(self, ident: str, limit: int) -> Optional[str]:
+        """Per-key request-count budget (0 = unlimited). Persists immediately."""
+        async with self._lock:
+            i = self._find_index(ident)
+            if i is None:
+                return None
+            self.keys[i].req_limit = max(0, limit)
+            full, masked = self.keys[i].key, self.keys[i].masked
+        if self.store is not None:
+            try:
+                await self.store.update_key(full, req_limit=max(0, limit))
+            except Exception as e:
+                print(f"[store] limit save failed: {e}")
+        return masked
 
     async def status(self):
         return [
@@ -157,7 +274,11 @@ class KeyPool:
                 "key": ks.masked,
                 "available": ks.available,
                 "tokens_used": ks.tokens_used,
-                "limit": MAX_TOKENS_PER_KEY,
+                "cached_tokens": ks.cached_tokens,
+                "limit": ks.eff_token_limit(),
+                "custom_limit": ks.token_limit,
+                "req_used": ks.req_used,
+                "req_limit": ks.req_limit,
                 "over_budget": ks.over_budget(),
                 "disabled": ks.disabled,
                 "success": ks.success,
@@ -165,6 +286,9 @@ class KeyPool:
             }
             for ks in self.keys
         ]
+
+    def pending_count(self) -> int:
+        return self.outbox.depth()
 
     async def add_key(self, key: str) -> bool:
         """Append key. Returns False if already present."""
@@ -207,15 +331,18 @@ class KeyPool:
             ks = self.keys[i]
             ks.disabled = not enabled
             masked, off = ks.masked, ks.disabled
-        await self._persist_one(ks, disabled=off)
+        self.outbox.add(ks.key, disabled=off)
         return masked
 
     async def reset_usage(self):
-        """Zero token counters + fail counts (budgets restart)."""
+        """Zero token/cached/request counters + fail counts (budgets restart)."""
         async with self._lock:
             for ks in self.keys:
                 ks.tokens_used = 0
+                ks.cached_tokens = 0
+                ks.req_used = 0
                 ks.fails = 0
+        self.outbox.drop()
         if self.store is not None:
             try:
                 await self.store.reset_usage()
@@ -232,24 +359,48 @@ class KeyPool:
             docs = await store.load()
         except Exception as e:
             print(f"[store] load from {store.label} failed: {e}; keeping local keys")
-            return
-        if not docs:
-            return
-        async with self._lock:
-            existing = {k.key: k for k in self.keys}
-            merged = []
-            for d in sorted(docs, key=lambda x: x.get("order", 0)):
-                k = d.get("key")
-                if not k:
+            docs = []
+        if docs:
+            async with self._lock:
+                existing = {k.key: k for k in self.keys}
+                merged = []
+                for d in sorted(docs, key=lambda x: x.get("order", 0)):
+                    k = d.get("key")
+                    if not k:
+                        continue
+                    ks = existing.get(k, KeyState(k))
+                    ks.tokens_used = int(d.get("tokens_used", ks.tokens_used or 0))
+                    ks.cached_tokens = int(d.get("cached_tokens", ks.cached_tokens or 0))
+                    ks.success = int(d.get("success", ks.success or 0))
+                    ks.fails = int(d.get("fails", ks.fails or 0))
+                    ks.req_used = int(d.get("req_used", ks.req_used or 0))
+                    ks.req_limit = int(d.get("req_limit", ks.req_limit or 0))
+                    ks.token_limit = int(d.get("token_limit", ks.token_limit or 0))
+                    if "disabled" in d:
+                        ks.disabled = bool(d["disabled"])
+                    merged.append(ks)
+                self.keys = merged
+        # Replay any deltas that never reached the store (crash window).
+        replayed = self.wal.take_all()
+        if replayed:
+            by_key: Dict[str, KeyState] = {k.key: k for k in self.keys}
+            n = 0
+            for e in replayed:
+                ks = by_key.get(e.get("key", ""))
+                if ks is None:
                     continue
-                ks = existing.get(k, KeyState(k))
-                ks.tokens_used = int(d.get("tokens_used", ks.tokens_used or 0))
-                ks.success = int(d.get("success", ks.success or 0))
-                ks.fails = int(d.get("fails", ks.fails or 0))
-                if "disabled" in d:
-                    ks.disabled = bool(d["disabled"])
-                merged.append(ks)
-            self.keys = merged
+                ks.tokens_used += max(0, int(e.get("tokens", 0)))
+                ks.cached_tokens += max(0, int(e.get("cached", 0)))
+                ks.success += max(0, int(e.get("success", 0)))
+                ks.fails += max(0, int(e.get("fails", 0)))
+                ks.req_used += max(0, int(e.get("reqs", 0)))
+                self.outbox.add(ks.key, tokens=max(0, int(e.get("tokens", 0))),
+                                cached=max(0, int(e.get("cached", 0))),
+                                success=max(0, int(e.get("success", 0))),
+                                fails=max(0, int(e.get("fails", 0))),
+                                reqs=max(0, int(e.get("reqs", 0))), log=False)
+                n += 1
+            print(f"[store] replayed {n} WAL entries")
 
     async def _persist_keys(self):
         if self.store is None:
@@ -263,16 +414,6 @@ class KeyPool:
         except Exception as e:
             print(f"[store] save to {self.store.label} failed: {e}")
 
-    async def _persist_one(self, ks: KeyState, tokens: int = 0, success: int = 0,
-                           fails: int = 0, disabled: Optional[bool] = None):
-        if self.store is None:
-            return
-        try:
-            await self.store.update_key(ks.key, tokens=tokens, success=success,
-                                        fails=fails, disabled=disabled)
-        except Exception as e:
-            print(f"[store] update {self.store.label} failed: {e}")
-
 
 pool = KeyPool(load_keys_list())
 if not Path(KEYS_FILE).exists() and pool.size:
@@ -284,31 +425,187 @@ if not Path(KEYS_FILE).exists() and pool.size:
 tg_app = None  # telegram Application, set in lifespan when enabled
 
 
-def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> int:
-    """Real usage.total_tokens when upstream reports it, else chars // 4 estimate."""
-    if isinstance(data, dict):
-        u = data.get("usage") or {}
-        if isinstance(u, dict):
-            total = u.get("total_tokens")
-            if isinstance(total, int) and total > 0:
-                return total
-            p = u.get("prompt_tokens", 0) or 0
-            c = u.get("completion_tokens", 0) or 0
-            if p or c:
-                return int(p) + int(c)
-    return (len(req_body) + len(resp_body)) // 4 or 1
+class SiteManager:
+    """Multiple upstream websites, each V1, V2, ... Telegram-switchable."""
+
+    def __init__(self, default_url: str):
+        self.sites = [{"id": "V1", "url": default_url}]
+        self.active_id = "V1"
+        self.store = None
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def norm(sid: str) -> str:
+        s = (sid or "").strip().upper()
+        if s.isdigit():
+            s = "V" + s
+        return s
+
+    async def attach(self, store):
+        self.store = store
+        try:
+            doc = await store.load_meta("sites")
+        except Exception as e:
+            print(f"[sites] load failed: {e}")
+            return
+        if not isinstance(doc, dict) or not doc.get("sites"):
+            return
+        valid = [s for s in doc["sites"]
+                 if isinstance(s, dict) and s.get("id") and s.get("url", "").startswith("http")]
+        if not valid:
+            return
+        async with self._lock:
+            self.sites = valid
+            if any(s["id"] == doc.get("active") for s in valid):
+                self.active_id = doc["active"]
+
+    async def _save(self):
+        if self.store is None:
+            return
+        try:
+            await self.store.save_meta("sites", {"sites": self.sites, "active": self.active_id})
+        except Exception as e:
+            print(f"[sites] save failed: {e}")
+
+    async def list_sites(self):
+        async with self._lock:
+            return [dict(s, active=(s["id"] == self.active_id)) for s in self.sites]
+
+    async def add_site(self, url: str) -> Optional[str]:
+        url = (url or "").strip().rstrip("/")
+        if not url.startswith("http"):
+            return None
+        async with self._lock:
+            n = 1
+            while any(s["id"] == f"V{n}" for s in self.sites):
+                n += 1
+            nid = f"V{n}"
+            self.sites.append({"id": nid, "url": url})
+        await self._save()
+        return nid
+
+    async def use_site(self, sid: str) -> bool:
+        sid = self.norm(sid)
+        async with self._lock:
+            if not any(s["id"] == sid for s in self.sites):
+                return False
+            self.active_id = sid
+        await self._save()
+        return True
+
+    async def remove_site(self, sid: str) -> bool:
+        sid = self.norm(sid)
+        async with self._lock:
+            if sid == self.active_id or len(self.sites) <= 1:
+                return False
+            before = len(self.sites)
+            self.sites = [s for s in self.sites if s["id"] != sid]
+            ok = len(self.sites) < before
+        if ok:
+            await self._save()
+        return ok
+
+    def resolve(self, override: Optional[str] = None) -> Optional[str]:
+        if override:
+            sid = self.norm(override)
+            for s in self.sites:
+                if s["id"] == sid:
+                    return s["url"]
+            return None
+        for s in self.sites:
+            if s["id"] == self.active_id:
+                return s["url"]
+        return self.sites[0]["url"] if self.sites else None
 
 
-def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> int:
-    """Usage chunk sometimes carries total_tokens at stream end; else estimate."""
+sites = SiteManager(UPSTREAM_BASE_URL)
+
+
+def extract_usage(data) -> tuple:
+    """(counted_tokens, cached_tokens) from an upstream response body.
+
+    Cached tokens are counted ON TOP (the platform bills them), taken from
+    OpenAI-style `prompt_tokens_details.cached_tokens`, Anthropic-style
+    `cache_read_input_tokens` / `cache_creation_input_tokens`, or the
+    generic `cached_tokens` / `prompt_cache_hit_tokens` fields.
+    """
+    if not isinstance(data, dict):
+        return 0, 0
+    u = data.get("usage") or {}
+    if not isinstance(u, dict):
+        return 0, 0
+    total = u.get("total_tokens")
+    if not isinstance(total, int) or total <= 0:
+        total = (u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0)
+    if total <= 0:
+        total = (u.get("input_tokens", 0) or 0) + (u.get("output_tokens", 0) or 0)
+    det = u.get("prompt_tokens_details") or {}
+    cached = (u.get("cached_tokens", 0) or 0) + (u.get("prompt_cache_hit_tokens", 0) or 0)
+    cached += (u.get("cache_read_input_tokens", 0) or 0) + (u.get("cache_creation_input_tokens", 0) or 0)
+    if isinstance(det, dict):
+        cached += det.get("cached_tokens", 0) or 0
+    return int(total), int(cached)
+
+
+_USAGE_KEYS = ("total_tokens", "input_tokens", "prompt_tokens",
+                "output_tokens", "completion_tokens")
+
+
+def _find_usage(obj):
+    """First usage-like dict in a parsed JSON body (OpenAI + Anthropic)."""
+    if isinstance(obj, dict):
+        u = obj.get("usage")
+        if isinstance(u, dict) and any(k in u for k in _USAGE_KEYS):
+            return u
+        for v in obj.values():
+            r = _find_usage(v)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_usage(v)
+            if r is not None:
+                return r
+    return None
+
+
+def _usage_from_text(text: bytes):
+    """Last envelope object containing usage in a body/SSE stream."""
     try:
-        import re
-        m = re.search(rb'"total_tokens"\s*:\s*(\d+)', stream_bytes)
-        if m:
-            return int(m.group(1))
+        raw = text.decode("utf-8", errors="replace")
     except Exception:
-        pass
-    return (len(req_body) + len(stream_bytes)) // 4 or 1
+        return None
+    best = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if _find_usage(obj) is not None:
+            best = obj
+    return best
+
+
+def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> tuple:
+    """(tokens, cached): real usage when reported, else chars // 4 estimate."""
+    total, cached = extract_usage(data)
+    if total > 0:
+        return total + cached, cached
+    est = (len(req_body) + len(resp_body)) // 4 or 1
+    return est, 0
+
+
+def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
+    """Usage chunk at stream end (exact, incl. cached); else estimate."""
+    total, cached = extract_usage(_usage_from_text(stream_bytes))
+    if total > 0:
+        return total + cached, cached
+    return (len(req_body) + len(stream_bytes)) // 4 or 1, 0
 
 
 @asynccontextmanager
@@ -325,6 +622,22 @@ async def lifespan(app: FastAPI):
         store = FileStore(KEYS_FILE)
     app.state.store = store
     await pool.use_store(store)
+    await sites.attach(store)
+
+    async def _flusher():
+        while True:
+            await asyncio.sleep(max(1, FLUSH_SEC))
+            try:
+                ok = await pool.outbox.flush(store)
+            except Exception as e:
+                ok = False
+                pool.last_store_error = str(e)[:200]
+                print(f"[outbox] flush crashed: {e}")
+            pool.store_ok = ok
+            if not ok:
+                pool.last_store_error = pool.last_store_error or "flush failed"
+
+    flush_task = asyncio.create_task(_flusher())
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_IDS:
         try:
             from bot import build_bot_app
@@ -338,6 +651,13 @@ async def lifespan(app: FastAPI):
     else:
         print("[telegram] disabled (set TELEGRAM_BOT_TOKEN + TELEGRAM_ADMIN_IDS to enable)")
     yield
+    flush_task.cancel()
+    try:
+        await pool.outbox.flush(store)  # final durable flush on clean shutdown
+        pool.store_ok = True
+    except Exception as e:
+        pool.store_ok = False
+        print(f"[outbox] shutdown flush failed: {e}")
     if tg_app is not None:
         try:
             await tg_app.updater.stop()
@@ -351,15 +671,20 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.5.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def check_proxy_auth(cred: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
+async def check_proxy_auth(request: Request,
+                           cred: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
+    """Proxy credential via OpenAI-style Bearer OR Anthropic-style x-api-key."""
     if not PROXY_API_KEY:
         return  # open proxy
-    if cred is None or cred.credentials != PROXY_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid proxy API key")
+    if cred is not None and cred.credentials == PROXY_API_KEY:
+        return
+    if request.headers.get("x-api-key") == PROXY_API_KEY:
+        return
+    raise HTTPException(status_code=401, detail="Invalid proxy API key")
 
 
 def is_exhausted(status_code: int, body_text: str) -> bool:
@@ -391,10 +716,14 @@ def build_upstream_headers(incoming: Request, api_key: str) -> dict:
     # forward safe headers
     for k, v in incoming.headers.items():
         kl = k.lower()
-        if kl in ("host", "authorization", "content-length", "connection"):
+        if kl in ("host", "authorization", "x-api-key", "content-length", "connection"):
             continue
         h[k] = v
-    h["Authorization"] = f"Bearer {api_key}"
+    if any(k.lower() == "x-api-key" for k in incoming.headers.keys()):
+        # Anthropic SDK style: rotate the key into x-api-key
+        h["X-Api-Key"] = api_key
+    else:
+        h["Authorization"] = f"Bearer {api_key}"
     if HTTP_REFERER:
         h["HTTP-Referer"] = HTTP_REFERER
     if X_TITLE:
@@ -408,9 +737,10 @@ async def health():
     avail = sum(1 for s in st if s["available"])
     used = sum(s["tokens_used"] for s in st)
     cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
-    return {"ok": True, "upstream": UPSTREAM_BASE_URL, "keys_total": len(st),
-            "keys_available": avail, "tokens_used_total": used,
-            "tokens_capacity_total": cap}
+    return {"ok": True, "upstream": UPSTREAM_BASE_URL, "site": sites.active_id,
+            "keys_total": len(st), "keys_available": avail,
+            "tokens_used_total": used, "tokens_capacity_total": cap,
+            "store_ok": pool.store_ok, "pending_updates": pool.pending_count()}
 
 
 @app.get("/keys/status")
@@ -440,11 +770,18 @@ async def proxy_request(request: Request):
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
     body = await request.body()
+    # Site selection: X-Site: V2 header, else the Telegram-active site.
+    site_ov = (request.headers.get("x-site") or "").strip()
+    base_url = sites.resolve(site_ov or None)
+    if base_url is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"unknown site '{site_ov}'. Use /sites in Telegram to list V1, V2, ..."})
     # strip /v1 prefix handling: client calls /v1/chat/completions -> upstream same path
     upstream_path = request.url.path  # e.g. /v1/chat/completions
     if request.url.query:
         upstream_path += f"?{request.url.query}"
-    upstream_url = f"{UPSTREAM_BASE_URL}{upstream_path[len('/v1'):]}" if upstream_path.startswith("/v1") else f"{UPSTREAM_BASE_URL}{upstream_path}"
+    upstream_url = f"{base_url}{upstream_path[len('/v1'):]}" if upstream_path.startswith("/v1") else f"{base_url}{upstream_path}"
 
     params_note = f"{request.method} {upstream_path}"
     last_error: Optional[str] = None
@@ -521,7 +858,7 @@ async def proxy_request(request: Request):
                             await _r.aclose()
                         finally:
                             await _c.aclose()
-                        await pool.add_usage(_k, count_stream_tokens(_b, bytes(buf)))
+                        await pool.add_usage(_k, *count_stream_tokens(_b, bytes(buf)))
 
                 return StreamingResponse(gen(), status_code=sresp.status_code,
                                          media_type="text/event-stream")
@@ -544,7 +881,7 @@ async def proxy_request(request: Request):
             # Success -> record tokens, return JSON
             if resp.status_code < 400:
                 data = resp.json() if resp.content else {}
-                await pool.mark_success(ks, count_tokens(body, resp.content, data))
+                await pool.mark_success(ks, *count_tokens(body, resp.content, data))
                 return JSONResponse(status_code=resp.status_code, content=data)
 
             # Failure -> next key in sequence (no cooldowns)

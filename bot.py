@@ -28,7 +28,13 @@ COMMAND_MENU = [
     ("health", "Upstream + overall usage"),
     ("stats", "Live per-key usage bars"),
     ("config", "Budget, store, timeouts"),
+    ("sites", "List upstream websites V1, V2…"),
+    ("siteadd", "Add website: /siteadd <url>"),
+    ("siteuse", "Switch website: /siteuse <V1>"),
+    ("siterm", "Remove website: /siterm <V1>"),
     ("add", "Add a provider key: /add <key>"),
+    ("limit", "Token budget per key: /limit <num> <n>"),
+    ("reqlimit", "Request budget per key: /reqlimit <num> <n>"),
     ("rm", "Remove a key: /rm <num>"),
     ("enable", "Re-enable a key: /enable <num>"),
     ("disable", "Take a key offline: /disable <num>"),
@@ -41,7 +47,13 @@ HELP_TEXT = (
     "/health – totals + upstream\n"
     "/stats – live overall + per-key bars\n"
     "/config – budget, store & timeouts\n"
+    "/sites – list websites (V1, V2…)\n"
+    "/siteadd <url> – add website\n"
+    "/siteuse <V1> – switch active website\n"
+    "/siterm <V1> – remove website\n"
     "/add <full-key> – add key\n"
+    "/limit <num> <tokens> – token budget for one key (0 = global)\n"
+    "/reqlimit <num> <n> – request budget for one key (0 = unlimited)\n"
     "/rm <num|mask> – remove key\n"
     "/enable <num> – re-enable key\n"
     "/disable <num> – take key offline\n"
@@ -83,8 +95,6 @@ def _bar(used: int, limit: int, width: int = 12) -> str:
 
 
 def _stats_lines(pool) -> list[str]:
-    import app as appmod
-    lim = appmod.MAX_TOKENS_PER_KEY
     lines = []
     for i, ks in enumerate(pool.keys, start=1):
         if ks.disabled:
@@ -93,7 +103,19 @@ def _stats_lines(pool) -> list[str]:
             state, extra = "❌", "over budget"
         else:
             state, extra = "✅", "in rotation"
-        lines.append(f"{i}. {state} `{ks.masked}` {_bar(ks.tokens_used, lim)} ok={ks.success} fail={ks.fails} ({extra})")
+        bits = f"{_bar(ks.tokens_used, ks.eff_token_limit())} ok={ks.success} fail={ks.fails}"
+        if ks.cached_tokens:
+            bits += f" ({ks.cached_tokens:,} cached)"
+        if ks.token_limit:
+            bits += f" [lim {ks.token_limit:,}]"
+        if ks.req_limit:
+            bits += f" [req {ks.req_used:,}/{ks.req_limit:,}]"
+        elif ks.req_used:
+            bits += f" [req {ks.req_used:,}]"
+        lines.append(f"{i}. {state} `{ks.masked}` {bits} ({extra})")
+    pend = pool.pending_count()
+    if pend:
+        lines.append(f"⚠️ `{pend}` updates not yet saved to store")
     return lines or ["(no keys)"]
 
 
@@ -116,11 +138,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def render_stats(pool) -> str:
-    import app as appmod
     total = len(pool.keys)
     used = sum(k.tokens_used for k in pool.keys)
-    lim = appmod.MAX_TOKENS_PER_KEY
-    overall = _bar(used, lim * total) if lim else f"`{used:,}` (no limit)"
+    cap = sum(k.eff_token_limit() for k in pool.keys)
+    overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
     return f"📊 *overall* {overall}\n\n🔑 *per key*\n" + "\n".join(_stats_lines(pool))
 
 
@@ -169,13 +190,15 @@ def _make_health(pool):
     total = len(pool.keys)
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
-    lim = appmod.MAX_TOKENS_PER_KEY
-    budget = _bar(used, lim * total) if lim else f"{used:,} (no limit)"
+    cap = sum(k.eff_token_limit() for k in pool.keys)
+    budget = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+    pend = pool.pending_count()
+    extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     return (
         f"❤️ *health*\n"
         f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
         f"keys: {avail}/{total} in rotation\n"
-        f"tokens total: {budget}"
+        f"tokens total: {budget}{extra}"
     )
 
 
@@ -242,7 +265,66 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await _deny(update)
     await ctx.bot_data["pool"].reset_usage()
     ctx.bot_data.pop("ms", None)  # restart live milestones from zero
-    await update.message.reply_text("♻️ All token counters zeroed.")
+    await update.message.reply_text("♻️ All token/request counters zeroed.")
+
+
+async def cmd_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
+        return await update.message.reply_text("Usage: /limit <num> <tokens>  e.g. /limit 1 50000 (0 = global)")
+    masked = await ctx.bot_data["pool"].set_token_limit(ctx.args[0], int(ctx.args[1]))
+    await update.message.reply_text(f"⚙️ Token budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+
+
+async def cmd_reqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
+        return await update.message.reply_text("Usage: /reqlimit <num> <requests>  e.g. /reqlimit 1 500 (0 = unlimited)")
+    masked = await ctx.bot_data["pool"].set_req_limit(ctx.args[0], int(ctx.args[1]))
+    await update.message.reply_text(f"⚙️ Request budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+
+
+async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    import app as appmod
+    lines = []
+    for s in await appmod.sites.list_sites():
+        mark = "🟢 active" if s.get("active") else "⚪"
+        lines.append(f"`{s['id']}` {mark} `{s['url']}`")
+    await update.message.reply_text("🌐 *websites*\n" + "\n".join(lines or ["(none)"]), parse_mode="Markdown")
+
+
+async def cmd_siteadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 1:
+        return await update.message.reply_text("Usage: /siteadd <https-url>  e.g. /siteadd https://api.other.com/v1")
+    import app as appmod
+    nid = await appmod.sites.add_site(ctx.args[0])
+    await update.message.reply_text(f"✅ Website added as `{nid}`" if nid else "❓ Need an http(s) URL.", parse_mode="Markdown")
+
+
+async def cmd_siteuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 1:
+        return await update.message.reply_text("Usage: /siteuse <V1> (see /sites)")
+    import app as appmod
+    ok = await appmod.sites.use_site(ctx.args[0])
+    await update.message.reply_text(f"🔀 Now serving `{ctx.args[0].upper()}`" if ok else "❓ Unknown site.", parse_mode="Markdown")
+
+
+async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 1:
+        return await update.message.reply_text("Usage: /siterm <V1> (not the active one)")
+    import app as appmod
+    ok = await appmod.sites.remove_site(ctx.args[0])
+    await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown, active, or last).")
 
 
 def _pct(used: int, limit: int) -> int:
@@ -254,12 +336,13 @@ async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
     import time
     import app as appmod
     pool = ctx.bot_data["pool"]
-    lim = appmod.MAX_TOKENS_PER_KEY
-    if lim <= 0:
-        return
     ms: dict = ctx.bot_data.setdefault("ms", {})
     seeded = "ms_seeded" in ctx.bot_data
     for ks in pool.keys:
+        lim = ks.eff_token_limit()
+        if lim <= 0:
+            ms.pop(ks.masked, None)
+            continue
         pct = _pct(ks.tokens_used, lim)
         prev = ms.get(ks.masked)
         if not seeded:
@@ -268,7 +351,7 @@ async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
         hit = [m for m in MILESTONES if (prev or 0) < m <= pct]
         ms[ks.masked] = pct
         if hit:
-            bar = _bar(ks.tokens_used, lim)
+            bar = _bar(ks.tokens_used, ks.eff_token_limit())
             for aid in _admin_ids():
                 try:
                     await ctx.bot.send_message(
@@ -328,6 +411,24 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     ctx.bot_data["prev_over"] = cur
+    ok = getattr(pool, "store_ok", True)
+    was_ok = ctx.bot_data.get("store_was_ok", True)
+    if was_ok and not ok:
+        for aid in _admin_ids():
+            try:
+                await ctx.bot.send_message(
+                    int(aid),
+                    f"⚠️ Storage failing — usage may lag (`{pool.pending_count()}` unsynced). Mongo/disk issue?",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+    elif ok and not was_ok:
+        for aid in _admin_ids():
+            try:
+                await ctx.bot.send_message(int(aid), "✅ Storage recovered, counters synced.")
+            except Exception:
+                pass
+    ctx.bot_data["store_was_ok"] = ok
 
 
 async def _post_init(app: Application):
@@ -373,6 +474,12 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("disable", cmd_disable))
     app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
+    app.add_handler(CommandHandler("limit", cmd_limit))
+    app.add_handler(CommandHandler("reqlimit", cmd_reqlimit))
+    app.add_handler(CommandHandler("sites", cmd_sites))
+    app.add_handler(CommandHandler("siteadd", cmd_siteadd))
+    app.add_handler(CommandHandler("siteuse", cmd_siteuse))
+    app.add_handler(CommandHandler("siterm", cmd_siterm))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
         app.job_queue.run_repeating(live_progress, interval=30, first=15)
