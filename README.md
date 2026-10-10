@@ -119,8 +119,9 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/rm <num>` - remove key by number from `/stats`
 - `/enable <num>` / `/disable <num>` - manual on/off
 - `/reset` - zero all token counters
-- Buttons: per-key ✅/⛔ toggles + Refresh in `/stats`, one-tap
-  `Use V2` switching in `/sites`, two-tap confirm on Reset
+- Buttons: 📊 Stats first asks V1/V2/All, then per-site numbers with
+  ✅/⛔ toggles; one-tap `Use V2` switching in `/sites`, two-tap
+  confirm on Reset
 - Budget is `.env`-only: `MAX_TOKENS_PER_KEY` (restart proxy to change)
 
 Auto-alerts: budget/over-budget + **live progress pushes at 50/80/100%

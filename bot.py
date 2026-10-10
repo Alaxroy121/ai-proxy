@@ -88,21 +88,44 @@ def panel_text(pool) -> str:
     )
 
 
-def stats_keyboard(pool) -> InlineKeyboardMarkup:
+def stats_keyboard(pool, site_id=None) -> InlineKeyboardMarkup:
+    if site_id:
+        items = [(i, ks) for i, ks in enumerate(pool.keys, start=1) if ks.site == site_id]
+        tag = lambda n: f"tg:{n}:{site_id}"
+    else:
+        items = [(i, ks) for i, ks in enumerate(pool.keys, start=1)]
+        tag = lambda n: f"toggle:{n}"
     rows, row = [], []
-    for i, ks in enumerate(pool.keys, start=1):
+    for i, ks in items:
         icon = "⛔" if ks.disabled else ("❌" if ks.over_budget() else "✅")
-        row.append(InlineKeyboardButton(f"{i} {icon}", callback_data=f"toggle:{i}"))
+        row.append(InlineKeyboardButton(f"{i} {icon}", callback_data=tag(i)))
         if len(row) == 4:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data="refresh:stats"),
-        InlineKeyboardButton("♻️ Reset", callback_data="reset:ask"),
-        HOME_BUTTON,
-    ])
+    if site_id:
+        rows.append([
+            InlineKeyboardButton("🌐 Websites", callback_data="stats"),
+            HOME_BUTTON,
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh:stats"),
+            InlineKeyboardButton("♻️ Reset", callback_data="reset:ask"),
+            HOME_BUTTON,
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def stats_picker_keyboard() -> InlineKeyboardMarkup:
+    import app as appmod
+    rows = []
+    for s in await appmod.sites.list_sites():
+        mark = "🟢" if s.get("active") else "⚪"
+        rows.append([InlineKeyboardButton(f"{mark} {s['id']}", callback_data=f"statssite:{s['id']}")])
+    rows.append([InlineKeyboardButton("🌐 All sites", callback_data="statssite:ALL")])
+    rows.append([HOME_BUTTON])
     return InlineKeyboardMarkup(rows)
 
 
@@ -290,7 +313,15 @@ async def _route_button(data: str, pool, ctx):
     if data == "panel":
         return panel_text(pool), MAIN_KEYBOARD
     if data == "stats":
-        return render_stats(pool), stats_keyboard(pool)
+        return "📊 *Stats — pick a website*", await stats_picker_keyboard()
+    if data.startswith("statssite:"):
+        sid = data.split(":", 1)[1]
+        if sid == "ALL":
+            return render_stats(pool), stats_keyboard(pool)
+        import app as _appmod
+        if sid not in [s["id"] for s in _appmod.sites.sites]:
+            return "❓ Unknown site.", await stats_picker_keyboard()
+        return render_stats(pool, sid), stats_keyboard(pool, sid)
     if data == "health":
         return _make_health(pool), health_keyboard()
     if data == "config":
@@ -305,6 +336,16 @@ async def _route_button(data: str, pool, ctx):
         return _make_health(pool), health_keyboard()
     if data == "refresh:sites":
         return await render_sites(), await sites_keyboard()
+    if data.startswith("tg:"):
+        parts = data.split(":")
+        num = parts[1] if len(parts) > 1 else ""
+        site = parts[2] if len(parts) > 2 else ""
+        masked = await pool.set_enabled(num, _key_disabled(pool, f"toggle:{num}"))
+        if not masked:
+            return "❓ Key not found.", stats_keyboard(pool, site or None)
+        if site:
+            return render_stats(pool, site), stats_keyboard(pool, site)
+        return render_stats(pool), stats_keyboard(pool)
     if data.startswith("toggle:"):
         masked = await pool.set_enabled(data.split(":", 1)[1], _key_disabled(pool, data))
         text = render_stats(pool) if masked else "❓ Key not found."
