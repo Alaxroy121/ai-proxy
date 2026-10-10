@@ -68,6 +68,16 @@ print(m.content[0].text)
 - `GET /keys/status` - which key is live / cooling down
 - `POST /keys/reload` - reload keys after editing env
 
+## Troubleshooting
+- Buttons spin with no response / two processes answer: only ONE proxy may
+  run per bot token. Kill duplicates, then start fresh:
+  ```bash
+  ./start.sh stop; pkill -f "uvicorn app:app"; sleep 2
+  ps aux | grep uvicorn | grep -v grep   # must show nothing
+  ./start.sh start
+  ```
+- Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
+
 ## Storage: local file vs MongoDB
 
 Unstable server disk (files like `keys.txt` / `proxy.log` vanish)? Set

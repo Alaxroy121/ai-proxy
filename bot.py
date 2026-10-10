@@ -270,49 +270,59 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     pool = ctx.bot_data["pool"]
     data = q.data or ""
-    text, kb = HELP_TEXT, MAIN_KEYBOARD
+    if data == "noop":
+        return  # active-site label button: nothing to do
+    try:
+        uid = update.effective_user.id if update.effective_user else "?"
+        print(f"[bot] button '{data}' from {uid}")
+        text, kb = await _route_button(data, pool, ctx)
+    except Exception as e:
+        print(f"[bot] button '{data}' failed: {e}")
+        text, kb = f"❌ Button failed: `{e}`\nTry again or use the typed command.", MAIN_KEYBOARD
+    try:
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        print(f"[bot] edit failed: {e}")
+
+
+async def _route_button(data: str, pool, ctx):
+    """Returns (text, keyboard). Raises on failure (caller shows it)."""
     if data == "panel":
-        text, kb = panel_text(pool), MAIN_KEYBOARD
-    elif data == "stats":
-        text, kb = render_stats(pool), stats_keyboard(pool)
-    elif data == "health":
-        text, kb = _make_health(pool), health_keyboard()
-    elif data == "config":
-        text, kb = render_config(pool), MAIN_KEYBOARD
-    elif data == "help":
-        text, kb = HELP_TEXT, MAIN_KEYBOARD
-    elif data == "sites":
-        text, kb = await render_sites(), await sites_keyboard()
-    elif data == "refresh:stats":
-        text, kb = render_stats(pool), stats_keyboard(pool)
-    elif data == "refresh:health":
-        text, kb = _make_health(pool), health_keyboard()
-    elif data == "refresh:sites":
-        text, kb = await render_sites(), await sites_keyboard()
-    elif data.startswith("toggle:"):
+        return panel_text(pool), MAIN_KEYBOARD
+    if data == "stats":
+        return render_stats(pool), stats_keyboard(pool)
+    if data == "health":
+        return _make_health(pool), health_keyboard()
+    if data == "config":
+        return render_config(pool), MAIN_KEYBOARD
+    if data == "help":
+        return HELP_TEXT, MAIN_KEYBOARD
+    if data == "sites":
+        return await render_sites(), await sites_keyboard()
+    if data == "refresh:stats":
+        return render_stats(pool), stats_keyboard(pool)
+    if data == "refresh:health":
+        return _make_health(pool), health_keyboard()
+    if data == "refresh:sites":
+        return await render_sites(), await sites_keyboard()
+    if data.startswith("toggle:"):
         masked = await pool.set_enabled(data.split(":", 1)[1], _key_disabled(pool, data))
         text = render_stats(pool) if masked else "❓ Key not found."
-        kb = stats_keyboard(pool)
-    elif data.startswith("siteuse:"):
+        return text, stats_keyboard(pool)
+    if data.startswith("siteuse:"):
         import app as appmod
         ok = await appmod.sites.use_site(data.split(":", 1)[1])
         text = await render_sites() if ok else "❓ Unknown site."
-        kb = await sites_keyboard()
-    elif data == "reset:ask":
-        text = "⚠️ Zero *all* token/request counters?"
-        kb = RESET_CONFIRM_KEYBOARD
-    elif data == "reset:yes":
+        return text, await sites_keyboard()
+    if data == "reset:ask":
+        return "⚠️ Zero *all* token/request counters?", RESET_CONFIRM_KEYBOARD
+    if data == "reset:yes":
         await pool.reset_usage()
         ctx.bot_data.pop("ms", None)
-        text, kb = "♻️ Counters zeroed.\n\n" + render_stats(pool), stats_keyboard(pool)
-    elif data == "reset:no":
-        text, kb = render_stats(pool), stats_keyboard(pool)
-    elif data == "noop":
-        return
-    try:
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    except Exception:
-        pass
+        return "♻️ Counters zeroed.\n\n" + render_stats(pool), stats_keyboard(pool)
+    if data == "reset:no":
+        return render_stats(pool), stats_keyboard(pool)
+    return HELP_TEXT, MAIN_KEYBOARD
 
 
 def _key_disabled(pool, data: str) -> bool:
