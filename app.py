@@ -79,6 +79,7 @@ class KeyState:
     req_used: int = 0
     req_limit: int = 0  # 0 = unlimited requests
     token_limit: int = 0  # 0 = use global MAX_TOKENS_PER_KEY
+    site: str = "V1"  # which website (upstream) this key belongs to
     disabled: bool = False  # manual off via Telegram
 
     def __post_init__(self):
@@ -191,32 +192,34 @@ class KeyPool:
     def size(self) -> int:
         return len(self.keys)
 
-    async def _scan_locked(self) -> Optional[KeyState]:
-        """First available key from _current onward (caller holds the lock)."""
+    async def _scan_locked(self, site_id: Optional[str] = None) -> Optional[KeyState]:
+        """First available key from _current onward, optionally for one site."""
         n = len(self.keys)
         if n == 0:
             return None
         for i in range(n):
             ks = self.keys[(self._current + i) % n]
+            if site_id is not None and ks.site != site_id:
+                continue
             if ks.available:
                 self._current = (self._current + i) % n
                 return ks
         return None
 
-    async def next_key(self) -> Optional[KeyState]:
-        """Current key until its budget is full, then shift to the next one."""
+    async def next_key(self, site_id: Optional[str] = None) -> Optional[KeyState]:
+        """Current key of a site until its budget is full, then shift within the site."""
         async with self._lock:
-            return await self._scan_locked()
+            return await self._scan_locked(site_id)
 
-    async def advance_past(self, bad: KeyState) -> Optional[KeyState]:
-        """Skip a just-failed key and shift to the next available one."""
+    async def advance_past(self, bad: KeyState, site_id: Optional[str] = None) -> Optional[KeyState]:
+        """Skip a just-failed key and shift to the next available one (same site)."""
         async with self._lock:
             n = len(self.keys)
             for i, ks in enumerate(self.keys):
                 if ks is bad:
                     self._current = (i + 1) % n
                     break
-            return await self._scan_locked()
+            return await self._scan_locked(site_id)
 
     async def mark_success(self, ks: KeyState, tokens: int = 0, cached: int = 0):
         async with self._lock:
@@ -268,10 +271,12 @@ class KeyPool:
                 print(f"[store] limit save failed: {e}")
         return masked
 
-    async def status(self):
+    async def status(self, site_id: Optional[str] = None):
+        keys = [ks for ks in self.keys if site_id is None or ks.site == site_id]
         return [
             {
                 "key": ks.masked,
+                "site": ks.site,
                 "available": ks.available,
                 "tokens_used": ks.tokens_used,
                 "cached_tokens": ks.cached_tokens,
@@ -284,19 +289,19 @@ class KeyPool:
                 "success": ks.success,
                 "fails": ks.fails,
             }
-            for ks in self.keys
+            for ks in keys
         ]
 
     def pending_count(self) -> int:
         return self.outbox.depth()
 
-    async def add_key(self, key: str) -> bool:
-        """Append key. Returns False if already present."""
+    async def add_key(self, key: str, site: str = "V1") -> bool:
+        """Append key to a site. Returns False if already present."""
         key = key.strip()
         async with self._lock:
             if any(k.key == key for k in self.keys):
                 return False
-            self.keys.append(KeyState(key))
+            self.keys.append(KeyState(key, site=site))
         await self._persist_keys()
         return True
 
@@ -376,6 +381,7 @@ class KeyPool:
                     ks.req_used = int(d.get("req_used", ks.req_used or 0))
                     ks.req_limit = int(d.get("req_limit", ks.req_limit or 0))
                     ks.token_limit = int(d.get("token_limit", ks.token_limit or 0))
+                    ks.site = str(d.get("site", ks.site or "V1") or "V1")
                     if "disabled" in d:
                         ks.disabled = bool(d["disabled"])
                     merged.append(ks)
@@ -403,14 +409,16 @@ class KeyPool:
             print(f"[store] replayed {n} WAL entries")
 
     async def _persist_keys(self):
+        items = [{"key": k.key, "site": k.site} for k in self.keys]
         if self.store is None:
             try:
-                save_keys_list([k.key for k in self.keys])
+                from store import FileStore
+                await FileStore(KEYS_FILE).save_keys(items)
             except Exception as e:
                 print(f"[store] file save failed: {e}")
             return
         try:
-            await self.store.save_keys([k.key for k in self.keys])
+            await self.store.save_keys(items)
         except Exception as e:
             print(f"[store] save to {self.store.label} failed: {e}")
 
@@ -506,16 +514,22 @@ class SiteManager:
         return ok
 
     def resolve(self, override: Optional[str] = None) -> Optional[str]:
+        return self.pick(override)[1]
+
+    def pick(self, override: Optional[str] = None):
+        """(site_id, url) for an override or the active site; url None if unknown."""
         if override:
             sid = self.norm(override)
             for s in self.sites:
                 if s["id"] == sid:
-                    return s["url"]
-            return None
+                    return sid, s["url"]
+            return sid, None
         for s in self.sites:
             if s["id"] == self.active_id:
-                return s["url"]
-        return self.sites[0]["url"] if self.sites else None
+                return s["id"], s["url"]
+        if self.sites:
+            return self.sites[0]["id"], self.sites[0]["url"]
+        return None, None
 
 
 sites = SiteManager(UPSTREAM_BASE_URL)
@@ -671,7 +685,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.6.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -772,7 +786,7 @@ async def proxy_request(request: Request):
     body = await request.body()
     # Site selection: X-Site: V2 header, else the Telegram-active site.
     site_ov = (request.headers.get("x-site") or "").strip()
-    base_url = sites.resolve(site_ov or None)
+    site_id, base_url = sites.pick(site_ov or None)
     if base_url is None:
         return JSONResponse(
             status_code=400,
@@ -792,11 +806,11 @@ async def proxy_request(request: Request):
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
-            ks = await pool.next_key()
+            ks = await pool.next_key(site_id)
             if ks is None:
                 raise HTTPException(
                     status_code=503,
-                    detail="All API keys over token budget or disabled. /resetusage or add keys.",
+                    detail=f"No usable keys for site {site_id}. Budgets full, disabled, or none assigned.",
                 )
             tried += 1
             headers = build_upstream_headers(request, ks.key)
@@ -827,7 +841,7 @@ async def proxy_request(request: Request):
                     await sclient.aclose()
                     last_error = f"network error with {ks.masked}: {e}"
                     await pool.mark_failed(ks)
-                    await pool.advance_past(ks)
+                    await pool.advance_past(ks, site_id)
                     continue  # shift to next key
                 if sresp.status_code >= 400:
                     raw = await sresp.aread()
@@ -841,7 +855,7 @@ async def proxy_request(request: Request):
                     last_status = sresp.status_code
                     await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
-                        await pool.advance_past(ks)
+                        await pool.advance_past(ks, site_id)
                         continue  # rate-limit / dead key / blip -> shift to next key
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
@@ -873,7 +887,7 @@ async def proxy_request(request: Request):
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
                 await pool.mark_failed(ks)
-                await pool.advance_past(ks)
+                await pool.advance_past(ks, site_id)
                 continue  # shift to next key
 
             ctype = resp.headers.get("content-type", "")
@@ -894,7 +908,7 @@ async def proxy_request(request: Request):
             await pool.mark_failed(ks)
 
             if _retryable(resp.status_code, text):
-                await pool.advance_past(ks)
+                await pool.advance_past(ks, site_id)
                 continue  # rate-limit / dead key / blip -> shift to next key
 
             # Real client error (400, 404, 422...) -> don't rotate further, return as-is

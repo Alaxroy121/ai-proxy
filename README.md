@@ -95,6 +95,9 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/sites` - list upstream websites (V1, V2, …)
 - `/siteadd <url>` / `/siteuse <V2>` / `/siterm <V1>` - manage websites live
   (clients can also pin one request via `X-Site: V2` header)
+- Keys belong to one website: `/add <key> [V2]` (default: active site).
+  Traffic on V1 only spends V1 keys. `/stats [V2]` filters by site.
+  A site can't be removed while keys point at it — `/rm` them first.
 - `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
 - `/limit <num> <tokens>` - token budget for one key (`0` = global default)

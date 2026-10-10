@@ -55,6 +55,17 @@ class UsageWal:
             print(f"[wal] clear failed: {e}")
 
 
+def _norm_key_items(keys) -> List[Dict[str, Any]]:
+    """Accept [{'key','site'}] or plain key strings (site defaults V1)."""
+    out = []
+    for i, k in enumerate(keys):
+        if isinstance(k, dict):
+            out.append({"key": k.get("key", ""), "site": k.get("site") or "V1", "order": i})
+        else:
+            out.append({"key": k, "site": "V1", "order": i})
+    return [d for d in out if d["key"]]
+
+
 class FileStore:
     name = "file"
 
@@ -71,12 +82,22 @@ class FileStore:
     async def load(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
             return []
-        keys = [l.strip() for l in self.path.read_text().splitlines()
-                if l.strip() and not l.strip().startswith("#")]
-        return [{"key": k, "order": i} for i, k in enumerate(keys)]
+        out = []
+        for i, line in enumerate(self.path.read_text().splitlines()):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|" in line:
+                site, key = line.split("|", 1)
+                out.append({"key": key.strip(), "site": site.strip() or "V1", "order": i})
+            else:
+                out.append({"key": line, "site": "V1", "order": i})
+        return [d for d in out if d["key"]]
 
-    async def save_keys(self, keys: List[str]):
-        self.path.write_text("\n".join(keys) + ("\n" if keys else ""))
+    async def save_keys(self, keys):
+        items = _norm_key_items(keys)
+        lines = [f"{d['site']}|{d['key']}" if d["site"] != "V1" else d["key"] for d in items]
+        self.path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
     async def update_key(self, key: str, tokens: int = 0, cached: int = 0, success: int = 0,
                          fails: int = 0, reqs: int = 0, disabled: Optional[bool] = None,
@@ -134,6 +155,7 @@ class MongoStore:
             out.append({
                 "key": d.get("_id"),
                 "order": d.get("order", 0),
+                "site": d.get("site") or "V1",
                 "tokens_used": int(d.get("tokens_used", 0)),
                 "cached_tokens": int(d.get("cached_tokens", 0)),
                 "success": int(d.get("success", 0)),
@@ -145,17 +167,18 @@ class MongoStore:
             })
         return [d for d in out if d["key"]]
 
-    async def save_keys(self, keys: List[str]):
-        for i, k in enumerate(keys):
+    async def save_keys(self, keys):
+        for item in _norm_key_items(keys):
+            k = item["key"]
             await self.col.update_one(
                 {"_id": k},
                 {"$setOnInsert": {"tokens_used": 0, "cached_tokens": 0, "success": 0,
                                   "fails": 0, "req_used": 0, "req_limit": 0,
                                   "token_limit": 0, "disabled": False},
-                 "$set": {"order": i}},
+                 "$set": {"order": item["order"], "site": item["site"]}},
                 upsert=True,
             )
-        await self.col.delete_many({"_id": {"$nin": list(keys)}})
+        await self.col.delete_many({"_id": {"$nin": [d["key"] for d in _norm_key_items(keys)]}})
 
     async def update_key(self, key: str, tokens: int = 0, cached: int = 0, success: int = 0,
                          fails: int = 0, reqs: int = 0, disabled: Optional[bool] = None,

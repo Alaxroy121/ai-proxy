@@ -26,13 +26,13 @@ MILESTONES = (50, 80, 100)  # live progress pushes when a key crosses these %
 COMMAND_MENU = [
     ("start", "Control panel with buttons"),
     ("health", "Upstream + overall usage"),
-    ("stats", "Live per-key usage bars"),
+    ("stats", "Keys by website: /stats [V1]"),
     ("config", "Budget, store, timeouts"),
     ("sites", "List upstream websites V1, V2…"),
     ("siteadd", "Add website: /siteadd <url>"),
     ("siteuse", "Switch website: /siteuse <V1>"),
     ("siterm", "Remove website: /siterm <V1>"),
-    ("add", "Add a provider key: /add <key>"),
+    ("add", "Add a key: /add <key> [V1]"),
     ("limit", "Token budget per key: /limit <num> <n>"),
     ("reqlimit", "Request budget per key: /reqlimit <num> <n>"),
     ("rm", "Remove a key: /rm <num>"),
@@ -45,13 +45,13 @@ COMMAND_MENU = [
 HELP_TEXT = (
     "Commands:\n"
     "/health – totals + upstream\n"
-    "/stats – live overall + per-key bars\n"
+    "/stats [V1] – keys grouped by website\n"
     "/config – budget, store & timeouts\n"
     "/sites – list websites (V1, V2…)\n"
     "/siteadd <url> – add website\n"
     "/siteuse <V1> – switch active website\n"
     "/siterm <V1> – remove website\n"
-    "/add <full-key> – add key\n"
+    "/add <full-key> [V1] – add key to a website (default: active)\n"
     "/limit <num> <tokens> – token budget for one key (0 = global)\n"
     "/reqlimit <num> <n> – request budget for one key (0 = unlimited)\n"
     "/rm <num|mask> – remove key\n"
@@ -168,9 +168,10 @@ def _bar(used: int, limit: int, width: int = 12) -> str:
     return f"`{'▰' * fill}{'▱' * (width - fill)}` {pct}% ({used:,}/{limit:,})"
 
 
-def _stats_lines(pool) -> list[str]:
+def _stats_lines(items) -> list[str]:
+    """items: [(1-based number, KeyState)]. Numbers stay global (toggle/rm use them)."""
     lines = []
-    for i, ks in enumerate(pool.keys, start=1):
+    for i, ks in items:
         if ks.disabled:
             state, extra = "⛔", "disabled"
         elif ks.over_budget():
@@ -187,9 +188,6 @@ def _stats_lines(pool) -> list[str]:
         elif ks.req_used:
             bits += f" [req {ks.req_used:,}]"
         lines.append(f"{i}. {state} `{ks.masked}` {bits} ({extra})")
-    pend = pool.pending_count()
-    if pend:
-        lines.append(f"⚠️ `{pend}` updates not yet saved to store")
     return lines or ["(no keys)"]
 
 
@@ -209,12 +207,40 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 
-def render_stats(pool) -> str:
-    total = len(pool.keys)
-    used = sum(k.tokens_used for k in pool.keys)
-    cap = sum(k.eff_token_limit() for k in pool.keys)
-    overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
-    return f"📊 *overall* {overall}\n\n🔑 *per key*\n" + "\n".join(_stats_lines(pool))
+def _numbered(pool, site_id=None):
+    return [(i, ks) for i, ks in enumerate(pool.keys, start=1)
+            if site_id is None or ks.site == site_id]
+
+
+def render_stats(pool, site_filter=None) -> str:
+    import app as appmod
+    known = [s["id"] for s in appmod.sites.sites]
+    groups = []
+    if site_filter:
+        groups = [(site_filter, _numbered(pool, site_filter))]
+    else:
+        for s in appmod.sites.sites:
+            items = _numbered(pool, s["id"])
+            if items:
+                groups.append((s["id"], items))
+        orphans = [(i, ks) for i, ks in enumerate(pool.keys, start=1) if ks.site not in known]
+        if orphans:
+            groups.append(("?", orphans))
+    sections = []
+    for sid, items in groups:
+        if sid == "?":
+            title = "❓ *unknown site*"
+        else:
+            mark = "🟢" if sid == appmod.sites.active_id else "⚪"
+            title = f"{mark} *{sid}* `{appmod.sites.resolve(sid) or '?'}`"
+        used = sum(ks.tokens_used for _, ks in items)
+        cap = sum(ks.eff_token_limit() for _, ks in items)
+        overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+        sections.append(f"{title}\n📊 overall {overall}\n" + "\n".join(_stats_lines(items)))
+    body = "\n\n".join(sections) or "(no keys on this site)"
+    if pool.pending_count() and site_filter is None:
+        body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
+    return f"🔑 *keys by website*\n\n{body}"
 
 
 def render_config(pool=None) -> str:
@@ -323,7 +349,11 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    await update.message.reply_text(render_stats(ctx.bot_data["pool"]), parse_mode="Markdown",
+    import app as appmod
+    site = appmod.SiteManager.norm(ctx.args[0]) if ctx.args else None
+    if site and site not in [s["id"] for s in appmod.sites.sites]:
+        return await update.message.reply_text("❓ Unknown site. See /sites.")
+    await update.message.reply_text(render_stats(ctx.bot_data["pool"], site), parse_mode="Markdown",
                                         reply_markup=stats_keyboard(ctx.bot_data["pool"]))
 
 
@@ -337,11 +367,15 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if not ctx.args:
-        return await update.message.reply_text("Usage: /add <full-api-key>")
+        return await update.message.reply_text("Usage: /add <full-api-key> [V1] (site defaults to active)")
+    import app as appmod
+    site = appmod.SiteManager.norm(ctx.args[1]) if len(ctx.args) > 1 else appmod.sites.active_id
+    if site not in [s["id"] for s in appmod.sites.sites]:
+        return await update.message.reply_text("❓ Unknown site. See /sites.")
     pool = ctx.bot_data["pool"]
-    ok = await pool.add_key(ctx.args[0])
+    ok = await pool.add_key(ctx.args[0], site)
     if ok:
-        await update.message.reply_text("✅ Key added and saved to keys.txt. Please delete your /add message for safety.")
+        await update.message.reply_text(f"✅ Key added to `{site}` and saved. Please delete your /add message for safety.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ That key is already in the pool.")
 
@@ -432,6 +466,9 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) != 1:
         return await update.message.reply_text("Usage: /siterm <V1> (not the active one)")
     import app as appmod
+    sid = appmod.SiteManager.norm(ctx.args[0])
+    if any(ks.site == sid for ks in ctx.bot_data["pool"].keys):
+        return await update.message.reply_text("❓ Site still has keys — /rm them first (see /stats).")
     ok = await appmod.sites.remove_site(ctx.args[0])
     await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown, active, or last).")
 
