@@ -77,6 +77,10 @@ print(m.content[0].text)
   ./start.sh start
   ```
 - Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
+- `/` menu not showing: the bot registers it itself on every boot
+  (watch `proxy.log` for `menu registered: 16 commands` + an `online`
+  DM). If missing: kill duplicate processes (above), restart, then
+  fully close + reopen the Telegram chat (client caches the menu).
 
 ## Storage: local file vs MongoDB
 

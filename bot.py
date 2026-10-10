@@ -588,27 +588,57 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init(app: Application):
-    """Initialize bot commands in Telegram menu."""
-    from telegram import BotCommand
+    """Register the / command menu via setMyCommands (no @BotFather needed).
+
+    Retries on flaky networks, covers both Default and AllPrivateChats
+    scopes, verifies with getMyCommands, and pings admins on success.
+    """
+    import asyncio
+    from telegram import BotCommand, BotCommandScopeAllPrivateChats
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    
     if not token:
         print("[telegram] ERROR: TELEGRAM_BOT_TOKEN not set in environment!")
         return
-    
+    commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
+    ok = False
+    for attempt in range(1, 4):
+        try:
+            await app.bot.set_my_commands(commands)
+            try:
+                await app.bot.set_my_commands(
+                    commands, scope=BotCommandScopeAllPrivateChats())
+            except Exception as e:
+                print(f"[telegram] private-scope menu failed: {e}")
+            check = await app.bot.get_my_commands()
+            print(f"[telegram] menu registered: {len(check)} commands (attempt {attempt})")
+            print(f"[telegram] Command list: {[c.command for c in commands]}")
+            ok = True
+            break
+        except Exception as e:
+            print(f"[telegram] menu attempt {attempt} failed: {e}")
+            await asyncio.sleep(2 * attempt)
+    if not ok:
+        print("[telegram] menu registration failed after retries")
+        return
+    for aid in _admin_ids():
+        try:
+            await app.bot.send_message(int(aid), "🤖 Proxy bot online — command menu synced.")
+        except Exception:
+            pass
+
+
+async def _resync_menu(ctx: ContextTypes.DEFAULT_TYPE):
+    """Second-chance menu sync a minute after boot (unstable networks)."""
+    bot = ctx.bot
     try:
-        # Convert COMMAND_MENU to BotCommand objects
-        commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_MENU]
-        
-        # Set commands for default scope (private chats)
-        await app.bot.set_my_commands(commands)
-        print(f"[telegram] ✅ Commands registered successfully with Telegram")
-        print(f"[telegram] Command list: {[c.command for c in commands]}")
-        
+        from telegram import BotCommand, BotCommandScopeAllPrivateChats
+        commands = [BotCommand(c, d) for c, d in COMMAND_MENU]
+        await bot.set_my_commands(commands)
+        await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        check = await bot.get_my_commands()
+        print(f"[telegram] menu re-sync ok: {len(check)} commands")
     except Exception as e:
-        print(f"[telegram] ❌ FAILED to register commands: {e}")
-        print(f"[telegram] Token valid: {bool(token)}")
-        print(f"[telegram] Make sure bot token is correct and bot can access Telegram API")
+        print(f"[telegram] menu re-sync failed: {e}")
 
 
 def build_bot_app(pool) -> Application:
@@ -639,4 +669,5 @@ def build_bot_app(pool) -> Application:
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
         app.job_queue.run_repeating(live_progress, interval=30, first=15)
+        app.job_queue.run_once(_resync_menu, when=60)
     return app
