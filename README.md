@@ -88,6 +88,7 @@ Setup (2 min):
 4. DM your bot `/health`
 
 DM commands (also in the `/` menu + buttons under `/start`):
+- `/start` - control panel: live status + buttons for everything below
 - `/health` - upstream + keys in rotation + tokens used
 - `/stats` - overall total bar + per-key usage bars (masked keys only)
 - `/config` - budget, timeouts, upstream, store backend
@@ -101,6 +102,8 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/rm <num>` - remove key by number from `/stats`
 - `/enable <num>` / `/disable <num>` - manual on/off
 - `/reset` - zero all token counters
+- Buttons: per-key ✅/⛔ toggles + Refresh in `/stats`, one-tap
+  `Use V2` switching in `/sites`, two-tap confirm on Reset
 - Budget is `.env`-only: `MAX_TOKENS_PER_KEY` (restart proxy to change)
 
 Auto-alerts: budget/over-budget + **live progress pushes at 50/80/100%

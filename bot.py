@@ -65,8 +65,82 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("📊 Stats", callback_data="stats"),
      InlineKeyboardButton("❤️ Health", callback_data="health")],
     [InlineKeyboardButton("⚙️ Config", callback_data="config"),
-     InlineKeyboardButton("ℹ️ Help", callback_data="help")],
+     InlineKeyboardButton("🌐 Sites", callback_data="sites")],
+    [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
 ])
+
+HOME_BUTTON = InlineKeyboardButton("🏠 Panel", callback_data="panel")
+
+
+def panel_text(pool) -> str:
+    import app as appmod
+    total = len(pool.keys)
+    avail = sum(1 for k in pool.keys if k.available)
+    used = sum(k.tokens_used for k in pool.keys)
+    cap = sum(k.eff_token_limit() for k in pool.keys)
+    overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
+    return (
+        "🤖 *Proxy control panel*\n"
+        "Fill-then-shift: one key until its budget is full.\n"
+        f"🌐 `{appmod.sites.active_id}` active · 🔑 {avail}/{total} keys\n"
+        f"📊 overall {overall}\n"
+        "📈 Live progress auto-pushes at 50/80/100%."
+    )
+
+
+def stats_keyboard(pool) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, ks in enumerate(pool.keys, start=1):
+        icon = "⛔" if ks.disabled else ("❌" if ks.over_budget() else "✅")
+        row.append(InlineKeyboardButton(f"{i} {icon}", callback_data=f"toggle:{i}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="refresh:stats"),
+        InlineKeyboardButton("♻️ Reset", callback_data="reset:ask"),
+        HOME_BUTTON,
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def health_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh:health"),
+         HOME_BUTTON],
+    ])
+
+
+async def sites_keyboard() -> InlineKeyboardMarkup:
+    import app as appmod
+    rows = []
+    for s in await appmod.sites.list_sites():
+        if s.get("active"):
+            rows.append([InlineKeyboardButton(f"✅ {s['id']} active", callback_data="noop")])
+        else:
+            rows.append([InlineKeyboardButton(f"▶️ Use {s['id']}", callback_data=f"siteuse:{s['id']}")])
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
+        HOME_BUTTON,
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+RESET_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("✅ Yes, zero them", callback_data="reset:yes"),
+     InlineKeyboardButton("❌ Cancel", callback_data="reset:no")],
+])
+
+
+async def render_sites() -> str:
+    import app as appmod
+    lines = []
+    for s in await appmod.sites.list_sites():
+        mark = "🟢 active" if s.get("active") else "⚪"
+        lines.append(f"`{s['id']}` {mark} `{s['url']}`")
+    return "🌐 *websites*\n" + "\n".join(lines or ["(none)"]) + "\n\nTap a button to switch."
 
 
 def _admin_ids() -> set:
@@ -123,9 +197,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await update.message.reply_text(
-        "🤖 *Proxy control panel*\n"
-        "Fill-then-shift: one key until its budget is full.\n"
-        "📈 Live progress auto-pushes at 50/80/100%.",
+        panel_text(ctx.bot_data["pool"]),
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -163,7 +235,7 @@ def render_config(pool=None) -> str:
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Inline buttons under /start (professional bot UX)."""
+    """Button router: panel, views, key toggles, site switching, reset confirm."""
     q = update.callback_query
     if not q or not _is_admin(update):
         if q:
@@ -171,18 +243,58 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
     pool = ctx.bot_data["pool"]
-    if q.data == "stats":
-        text = render_stats(pool)
-    elif q.data == "health":
-        text = _make_health(pool)
-    elif q.data == "config":
-        text = render_config(pool)
-    else:
-        text = HELP_TEXT
+    data = q.data or ""
+    text, kb = HELP_TEXT, MAIN_KEYBOARD
+    if data == "panel":
+        text, kb = panel_text(pool), MAIN_KEYBOARD
+    elif data == "stats":
+        text, kb = render_stats(pool), stats_keyboard(pool)
+    elif data == "health":
+        text, kb = _make_health(pool), health_keyboard()
+    elif data == "config":
+        text, kb = render_config(pool), MAIN_KEYBOARD
+    elif data == "help":
+        text, kb = HELP_TEXT, MAIN_KEYBOARD
+    elif data == "sites":
+        text, kb = await render_sites(), await sites_keyboard()
+    elif data == "refresh:stats":
+        text, kb = render_stats(pool), stats_keyboard(pool)
+    elif data == "refresh:health":
+        text, kb = _make_health(pool), health_keyboard()
+    elif data == "refresh:sites":
+        text, kb = await render_sites(), await sites_keyboard()
+    elif data.startswith("toggle:"):
+        masked = await pool.set_enabled(data.split(":", 1)[1], _key_disabled(pool, data))
+        text = render_stats(pool) if masked else "❓ Key not found."
+        kb = stats_keyboard(pool)
+    elif data.startswith("siteuse:"):
+        import app as appmod
+        ok = await appmod.sites.use_site(data.split(":", 1)[1])
+        text = await render_sites() if ok else "❓ Unknown site."
+        kb = await sites_keyboard()
+    elif data == "reset:ask":
+        text = "⚠️ Zero *all* token/request counters?"
+        kb = RESET_CONFIRM_KEYBOARD
+    elif data == "reset:yes":
+        await pool.reset_usage()
+        ctx.bot_data.pop("ms", None)
+        text, kb = "♻️ Counters zeroed.\n\n" + render_stats(pool), stats_keyboard(pool)
+    elif data == "reset:no":
+        text, kb = render_stats(pool), stats_keyboard(pool)
+    elif data == "noop":
+        return
     try:
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     except Exception:
         pass
+
+
+def _key_disabled(pool, data: str) -> bool:
+    try:
+        i = int(data.split(":", 1)[1]) - 1
+        return pool.keys[i].disabled
+    except Exception:
+        return False
 
 
 def _make_health(pool):
@@ -211,7 +323,8 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    await update.message.reply_text(render_stats(ctx.bot_data["pool"]), parse_mode="Markdown")
+    await update.message.reply_text(render_stats(ctx.bot_data["pool"]), parse_mode="Markdown",
+                                        reply_markup=stats_keyboard(ctx.bot_data["pool"]))
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -289,12 +402,8 @@ async def cmd_reqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    import app as appmod
-    lines = []
-    for s in await appmod.sites.list_sites():
-        mark = "🟢 active" if s.get("active") else "⚪"
-        lines.append(f"`{s['id']}` {mark} `{s['url']}`")
-    await update.message.reply_text("🌐 *websites*\n" + "\n".join(lines or ["(none)"]), parse_mode="Markdown")
+    await update.message.reply_text(await render_sites(),
+                                        parse_mode="Markdown", reply_markup=await sites_keyboard())
 
 
 async def cmd_siteadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
