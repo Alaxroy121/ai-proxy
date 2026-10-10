@@ -299,7 +299,8 @@ def _key_disabled(pool, data: str) -> bool:
 
 def _make_health(pool):
     import app as appmod
-    total = len(pool.keys)    avail = sum(1 for k in pool.keys if k.available)
+    total = len(pool.keys)
+    avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     cap = sum(k.eff_token_limit() for k in pool.keys)
     budget = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
