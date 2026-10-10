@@ -222,7 +222,7 @@ def render_config(pool=None) -> str:
     store = pool.store.label if pool is not None and pool.store else "file"
     return (
         "⚙️ *config*\n"
-        f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
+        f"upstream: `{appmod.sites.resolve()}` (`{appmod.sites.active_id}`)\n"
         f"mode: fill key 1 to budget, then shift to key 2, …\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"live milestones: `50/80/100%`\n"
@@ -299,8 +299,7 @@ def _key_disabled(pool, data: str) -> bool:
 
 def _make_health(pool):
     import app as appmod
-    total = len(pool.keys)
-    avail = sum(1 for k in pool.keys if k.available)
+    total = len(pool.keys)    avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     cap = sum(k.eff_token_limit() for k in pool.keys)
     budget = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
@@ -308,7 +307,7 @@ def _make_health(pool):
     extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     return (
         f"❤️ *health*\n"
-        f"upstream: `{appmod.UPSTREAM_BASE_URL}`\n"
+        f"upstream: `{appmod.sites.resolve()}` (`{appmod.sites.active_id}`)\n"
         f"keys: {avail}/{total} in rotation\n"
         f"tokens total: {budget}{extra}"
     )

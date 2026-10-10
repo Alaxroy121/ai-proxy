@@ -737,7 +737,7 @@ async def health():
     avail = sum(1 for s in st if s["available"])
     used = sum(s["tokens_used"] for s in st)
     cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
-    return {"ok": True, "upstream": UPSTREAM_BASE_URL, "site": sites.active_id,
+    return {"ok": True, "upstream": sites.resolve(), "site": sites.active_id,
             "keys_total": len(st), "keys_available": avail,
             "tokens_used_total": used, "tokens_capacity_total": cap,
             "store_ok": pool.store_ok, "pending_updates": pool.pending_count()}
