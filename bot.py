@@ -259,8 +259,13 @@ def render_stats(pool, site_filter=None) -> str:
         used = sum(ks.tokens_used for _, ks in items)
         cap = sum(ks.eff_token_limit() for _, ks in items)
         overall = _bar(used, cap) if cap else f"`{used:,}` (no limit)"
-        sections.append(f"{title}\n📊 overall {overall}\n" + "\n".join(_stats_lines(items)))
+        sections.append(f"{title}\n📊 overall ({sid}) {overall}\n" + "\n".join(_stats_lines(items)))
     body = "\n\n".join(sections) or "(no keys on this site)"
+    if site_filter is None:
+        all_used = sum(k.tokens_used for k in pool.keys)
+        all_cap = sum(k.eff_token_limit() for k in pool.keys)
+        grand = _bar(all_used, all_cap) if all_cap else f"`{all_used:,}` (no limit)"
+        body = f"🌍 *overall (all sites)* {grand}\n\n" + body
     if pool.pending_count() and site_filter is None:
         body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
     return f"🔑 *keys by website*\n\n{body}"
