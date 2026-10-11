@@ -82,7 +82,7 @@ print(m.content[0].text)
   ```
 - Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
 - `/` menu not showing: the bot registers it itself on every boot
-  (watch `proxy.log` for `menu registered: 23 commands` + an `online`
+  (watch `proxy.log` for `menu registered: 24 commands` + an `online`
   DM). Shortcut: send `/menu` (or tap 📋 Menu) — it re-syncs live and
   tells you the result. If synced but invisible, fully close + reopen
   the Telegram chat (client caches the menu).
@@ -121,8 +121,10 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/sitereset <V1> <hours>` - auto-zero that website's counters every N
   hours (`0` = off). Each provider resets billing on its own cycle —
   match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.
-- `/sitelimit <V1> <tokens>` - default token budget for that site's keys
+- `/sitelimit <V1> <tokens>` - default token budget on that site
   (`0` = global `MAX_TOKENS_PER_KEY`). Key-level `/limit` still wins.
+- `/sitereqlimit <V1> <n>` - default request budget on that site
+  (`0` = unlimited). Key-level `/reqlimit` still wins.
 - `/sitetimeout <V1> <sec>` - request timeout for that site (`0` = global).
 - `/siteheaders <V1> <referer> <title…>` - upstream headers for that site
   (`-` keeps the global). Shown as `[H]` in `/sites`, full in `/config`.
