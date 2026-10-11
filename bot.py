@@ -37,6 +37,7 @@ COMMAND_MENU = [
     ("siteswap", "Swap two sites: /siteswap <V1> <V2>"),
     ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
     ("sitelimit", "Site token budget: /sitelimit <V1> <n>"),
+    ("sitereqlimit", "Site request budget: /sitereqlimit <V1> <n>"),
     ("sitetimeout", "Site timeout: /sitetimeout <V1> <sec>"),
     ("siteheaders", "Site headers: /siteheaders <V1> <ref> <title>"),
     ("siterm", "Remove website: /siterm <V1>"),
@@ -64,6 +65,7 @@ HELP_TEXT = (
     "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
     "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
     "/sitelimit <V1> <tokens> – default token budget on that site (0 = global)\n"
+    "/sitereqlimit <V1> <n> – default request budget on that site (0 = unlimited)\n"
     "/sitetimeout <V1> <sec> – request timeout on that site (0 = global)\n"
     "/siteheaders <V1> <referer> <title…> – headers on that site (`-` = global)\n"
     "/siterm <V1> – remove website\n"
@@ -188,6 +190,8 @@ async def render_sites(pool=None) -> str:
         bits = ""
         if (s.get("token_budget") or 0) > 0:
             bits += f" [lim {_fmt(s['token_budget'])}]"
+        if (s.get("req_budget") or 0) > 0:
+            bits += f" [req {_fmt(s['req_budget'])}]"
         if (s.get("timeout") or 0) > 0:
             bits += f" [t/o {s['timeout']}s]"
         if s.get("referer") or s.get("title"):
@@ -294,7 +298,6 @@ def render_stats(pool, site_filter=None) -> str:
         if sid == "?":
             title = "❓ *unknown site*"
         else:
-            nkeys = len(items)
             title = f"*{sid}* `{appmod.sites.resolve(sid) or '?'}`"
         used = sum(ks.tokens_used for _, ks in items)
         cap = sum(ks.eff_token_limit() for _, ks in items)
@@ -319,6 +322,8 @@ def render_config(pool=None) -> str:
         bits = ""
         if (s.get("token_budget") or 0) > 0:
             bits += f" lim={_fmt(s['token_budget'])}"
+        if (s.get("req_budget") or 0) > 0:
+            bits += f" req={s['req_budget']}"
         if (s.get("timeout") or 0) > 0:
             bits += f" t/o={s['timeout']}s"
         if s.get("referer") or s.get("title"):
@@ -414,7 +419,6 @@ async def _route_button(data: str, pool, ctx, update=None):
         text = render_stats(pool) if masked else "❓ Key not found."
         return text, stats_keyboard(pool)
     if data.startswith("siteuse:"):
-        # Old "Use V2" buttons still floating in chat: show that site's info.
         import app as appmod
         sid = appmod.SiteManager.norm(data.split(":", 1)[1])
         hit = next((s for s in appmod.sites.sites if s["id"] == sid), None)
@@ -727,7 +731,7 @@ async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await update.message.reply_text(await render_sites(ctx.bot_data["pool"]),
-                                        parse_mode="Markdown", reply_markup=await sites_keyboard())
+                                    parse_mode="Markdown", reply_markup=await sites_keyboard())
 
 
 async def cmd_siteadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -812,6 +816,20 @@ async def cmd_sitelimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❓ Unknown site.")
     await update.message.reply_text(
         f"⚙️ Default token budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
+async def cmd_sitereqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
+        return await update.message.reply_text("Usage: /sitereqlimit <V1> <n>  e.g. /sitereqlimit V1 5000 (0 = unlimited)")
+    import app as appmod
+    ok = await appmod.sites.configure_site(ctx.args[0], req_budget=int(ctx.args[1]))
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.")
+    await update.message.reply_text(
+        f"⚙️ Default request budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
 
 
@@ -913,7 +931,6 @@ async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
     ctx.bot_data["ms_seeded"] = True
-    # optional periodic digest (LIVE_DIGEST_MIN=0 disables)
     try:
         every = int(os.getenv("LIVE_DIGEST_MIN", "0"))
     except ValueError:
@@ -1051,10 +1068,10 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def build_bot_app(pool) -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    
+
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
-    
+
     app = Application.builder().token(token).post_init(_post_init).build()
     app.bot_data["pool"] = pool
     app.add_handler(CallbackQueryHandler(on_button))
@@ -1079,6 +1096,7 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("siteswap", cmd_siteswap))
     app.add_handler(CommandHandler("sitereset", cmd_sitereset))
     app.add_handler(CommandHandler("sitelimit", cmd_sitelimit))
+    app.add_handler(CommandHandler("sitereqlimit", cmd_sitereqlimit))
     app.add_handler(CommandHandler("sitetimeout", cmd_sitetimeout))
     app.add_handler(CommandHandler("siteheaders", cmd_siteheaders))
     app.add_handler(CommandHandler("siterm", cmd_siterm))
