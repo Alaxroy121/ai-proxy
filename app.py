@@ -765,7 +765,7 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     await pool.use_store(store)
     await sites.attach(store)
-    print(f"[sites] loaded: {[(s['id'], s['url']) for s in sites.sites]} (all serve)")
+    print(f"[sites] loaded: {[(s['id'], s['url']) for s in sites.sites]} (/v1→V1, /v2→V2…)")
 
     async def _flusher():
         while True:
@@ -814,7 +814,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.8.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.9.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -883,7 +883,7 @@ async def health():
     avail = sum(1 for s in st if s["available"])
     used = sum(s["tokens_used"] for s in st)
     cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
-    return {"ok": True, "mode": "all-sites",
+    return {"ok": True, "mode": "path-pinned",
             "sites": [s["id"] for s in sites.sites],
             "keys_total": len(st), "keys_available": avail,
             "tokens_used_total": used, "tokens_capacity_total": cap,
@@ -915,12 +915,12 @@ async def proxy_request(request: Request):
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
     body = await request.body()
-    # Site selection, precedence: X-Site header > /vN path prefix > rotate all.
-    # /v1/... stays the all-sites default; /v2/..., /v3/... pin that site.
+    # Site selection, precedence: X-Site header > /vN path prefix.
+    # Strict mapping: /v1/... serves ONLY V1, /v2/... ONLY V2, etc.
     raw_path = request.url.path
     site_id = None
     m = re.match(r"^/[vV](\d+)(/.*)$", raw_path)
-    if m and m.group(1) != "1":
+    if m:
         sid = "V" + m.group(1)
         if sites.get_site(sid) is None:
             return JSONResponse(
@@ -931,8 +931,6 @@ async def proxy_request(request: Request):
     else:
         m_bare = re.match(r"^/[vV](\d+)$", raw_path)
         if m_bare:
-            if m_bare.group(1) == "1":
-                raise HTTPException(status_code=404, detail="Not Found")
             sid = "V" + m_bare.group(1)
             if sites.get_site(sid) is None:
                 return JSONResponse(
@@ -959,26 +957,16 @@ async def proxy_request(request: Request):
     tried = 0
     max_tries = min(MAX_RETRIES_PER_REQUEST, pool.size * 2)
     want_stream = _wants_stream(request, body)
-    order = await sites.take_order()
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
-            ks = sid = None
-            if site_id is not None:
-                sid = site_id
-                ks = await pool.next_key(sid)
-            else:
-                for cand in order:
-                    cand_ks = await pool.next_key(cand)
-                    if cand_ks is not None:
-                        ks, sid = cand_ks, cand
-                        break
+            # Strict per-path mapping: this request serves ONLY site_id.
+            sid = site_id
+            ks = await pool.next_key(sid)
             if ks is None:
                 raise HTTPException(
                     status_code=503,
-                    detail=(f"No usable keys for site {site_id}. Budgets full, disabled, or none assigned."
-                            if site_id is not None else
-                            "No usable keys on any site. Budgets full, disabled, or none assigned."),
+                    detail=f"No usable keys for site {sid}. Budgets full, disabled, or none assigned.",
                 )
             tried += 1
             upstream_url = f"{sites.resolve(sid)}{suffix}"
@@ -987,7 +975,7 @@ async def proxy_request(request: Request):
 
             if want_stream:
                 body_out = body
-                if upstream_path == "/v1/chat/completions":
+                if upstream_path == "/chat/completions":
                     try:
                         payload = json.loads(body) if body else {}
                         if isinstance(payload, dict):

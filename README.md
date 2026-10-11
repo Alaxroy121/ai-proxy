@@ -1,17 +1,16 @@
 # AI Key-Rotating Proxy (OpenRouter / OpenAI-compatible)
 
-Strict 1→2→3 rotation + preemptive token budgets. All websites serve
-at once: requests rotate V1, V2, … — each site spending only its own
-keys (one key to budget, then shift within that site).
+Strict 1→2→3 rotation + preemptive token budgets. Strict path mapping:
+`/v1/…` serves ONLY V1, `/v2/…` ONLY V2 — each site spending only its
+own keys (one key to budget, then shift within that site).
 
 ## How it works
 - You give it N keys: `API_KEYS=key1,key2,key3`
 - Clients call **the proxy** instead of the provider directly:
   `POST http://YOUR-VPS:25007/v1/chat/completions`
-- All requests rotate across sites → key1 of V1, key1 of V2, …; a site
-  whose keys are all over budget is skipped until `/reset`
-- Pin one site per request: `X-Site: V2` header, or path prefix
-  (`/v2/chat/completions` → V2; `/v1/…` stays all-sites rotation)
+- `/v1/chat/completions` → V1's keys only; `/v2/…` → V2's keys only.
+  A site whose keys are all over budget answers 503 until `/reset`.
+  Pin any path to another site per request with `X-Site: V2`.
 - If a key errors (402/401/429/5xx), the same request retries with the next key
 - Token counting: real `usage.total_tokens` when upstream reports it
   (streaming requests auto-add `stream_options.include_usage` so stream

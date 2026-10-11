@@ -102,7 +102,7 @@ def panel_text(pool) -> str:
     overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
     return (
         "🤖 *Proxy control panel*\n"
-        "All sites serve at once — requests rotate V1, V2, …\n"
+        "Each path serves its site: /v1→V1, /v2→V2, …\n"
         f"🌐 `{', '.join(s['id'] for s in appmod.sites.sites) or 'none'}` · 🔑 {avail}/{total} keys\n"
         f"📊 overall {overall}\n"
         "📈 Live progress auto-pushes at 50/80/100%."
@@ -197,8 +197,8 @@ async def render_sites(pool=None) -> str:
         if s.get("referer") or s.get("title"):
             bits += " [H]"
         lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}{bits}")
-    return "🌐 *websites — all serve at once*\n" + "\n".join(lines or ["(none)"]) + \
-        "\n\nTip: `/v2/chat/…` pins site V2, `/v1/…` rotates all."
+    return "🌐 *websites — one path per site*\n" + "\n".join(lines or ["(none)"]) + \
+        "\n\n`/v1/…` → V1 only, `/v2/…` → V2 only."
 
 
 def _admin_ids() -> set:
@@ -334,7 +334,7 @@ def render_config(pool=None) -> str:
     sitelines = "\n".join(sitelines) or "  (none)"
     return (
         "⚙️ *config*\n"
-        f"mode: all sites serve at once (X-Site pins one)\n"
+        f"mode: one path per site — /v1→V1, /v2→V2 (X-Site overrides)\n"
         f"websites:\n{sitelines}\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"live milestones: `50/80/100%`\n"
@@ -516,7 +516,7 @@ def _make_health(pool):
     ids = ", ".join(s["id"] for s in appmod.sites.sites) or "none"
     return (
         f"❤️ *health*\n"
-        f"sites: `{ids}` (all serve)\n"
+        f"sites: `{ids}` (/v1→V1, /v2→V2…)\n"
         f"keys: {avail}/{total} usable\n"
         f"tokens total: {budget}{extra}"
     )
