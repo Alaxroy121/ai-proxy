@@ -87,7 +87,10 @@ class KeyState:
         self.masked = f"{k[:7]}...{k[-4:]}" if len(k) > 12 else "***"
 
     def eff_token_limit(self) -> int:
-        return self.token_limit if self.token_limit > 0 else MAX_TOKENS_PER_KEY
+        if self.token_limit > 0:
+            return self.token_limit
+        sb = site_token_budget(self.site)
+        return sb if sb > 0 else MAX_TOKENS_PER_KEY
 
     def over_budget(self) -> bool:
         tlim = self.eff_token_limit()
@@ -455,12 +458,17 @@ class SiteManager:
     """Multiple upstream websites, each V1, V2, ... Telegram-switchable."""
 
     def __init__(self, default_url: str):
-        self.sites = [{"id": "V1", "url": default_url, "reset_hours": 0, "last_reset": 0.0}]
+        self.sites = [self._blank("V1", default_url)]
         self._cursor = 0
         self.store = None
         self._lock = asyncio.Lock()
         self.last_save_ok = True
         self.last_save_error = ""
+
+    @staticmethod
+    def _blank(sid: str, url: str) -> dict:
+        return {"id": sid, "url": url, "reset_hours": 0, "last_reset": 0.0,
+                "token_budget": 0, "timeout": 0, "referer": "", "title": ""}
 
     @staticmethod
     def norm(sid: str) -> str:
@@ -487,7 +495,11 @@ class SiteManager:
                 continue
             valid.append({"id": s["id"], "url": url.rstrip("/"),
                           "reset_hours": float(s.get("reset_hours") or 0),
-                          "last_reset": float(s.get("last_reset") or 0)})
+                          "last_reset": float(s.get("last_reset") or 0),
+                          "token_budget": int(s.get("token_budget") or 0),
+                          "timeout": int(s.get("timeout") or 0),
+                          "referer": s.get("referer") or "",
+                          "title": s.get("title") or ""})
         if not valid:
             return
         async with self._lock:
@@ -551,7 +563,7 @@ class SiteManager:
             while any(s["id"] == f"V{n}" for s in self.sites):
                 n += 1
             nid = f"V{n}"
-            self.sites.append({"id": nid, "url": url, "reset_hours": 0, "last_reset": 0.0})
+            self.sites.append(self._blank(nid, url))
         await self._save()
         return nid
 
@@ -579,7 +591,8 @@ class SiteManager:
             b = next((s for s in self.sites if s["id"] == sb), None)
             if a is None or b is None:
                 return False
-            for field in ("url", "reset_hours", "last_reset"):
+            for field in ("url", "reset_hours", "last_reset",
+                          "token_budget", "timeout", "referer", "title"):
                 a[field], b[field] = b[field], a[field]
         await self._save()
         return True
@@ -604,6 +617,29 @@ class SiteManager:
                 if s["id"] == sid:
                     s["last_reset"] = time.time()
         await self._save()
+
+    def get_site(self, sid: str) -> Optional[dict]:
+        sid = self.norm(sid)
+        return next((s for s in self.sites if s["id"] == sid), None)
+
+    async def configure_site(self, sid: str, token_budget=None, timeout=None,
+                             referer=None, title=None) -> bool:
+        """Per-website settings. Budgets/timeouts 0 = global; referer/title '' = global."""
+        sid = self.norm(sid)
+        async with self._lock:
+            hit = next((s for s in self.sites if s["id"] == sid), None)
+            if hit is None:
+                return False
+            if token_budget is not None:
+                hit["token_budget"] = max(0, int(token_budget))
+            if timeout is not None:
+                hit["timeout"] = max(0, int(timeout))
+            if referer is not None:
+                hit["referer"] = "" if referer == "-" else referer.strip()
+            if title is not None:
+                hit["title"] = "" if title == "-" else title.strip()
+        await self._save()
+        return True
 
     def due_sites(self):
         """Site IDs whose reset interval has elapsed."""
@@ -644,6 +680,19 @@ class SiteManager:
 
 
 sites = SiteManager(UPSTREAM_BASE_URL)
+
+
+def site_token_budget(site_id: str) -> int:
+    """Default token budget for a site's keys (0 = global). Key overrides win."""
+    s = sites.get_site(site_id)
+    return int((s or {}).get("token_budget") or 0)
+
+
+def site_timeout(site_id: str) -> int:
+    """Request timeout for a site (0 = global)."""
+    s = sites.get_site(site_id)
+    t = int((s or {}).get("timeout") or 0)
+    return t if t > 0 else REQUEST_TIMEOUT_SEC
 
 
 def extract_usage(data) -> tuple:
@@ -837,7 +886,7 @@ def _wants_stream(request: Request, body: bytes) -> bool:
     return "text/event-stream" in request.headers.get("accept", "").lower()
 
 
-def build_upstream_headers(incoming: Request, api_key: str) -> dict:
+def build_upstream_headers(incoming: Request, api_key: str, site_id: Optional[str] = None) -> dict:
     h = {}
     # forward safe headers
     for k, v in incoming.headers.items():
@@ -850,10 +899,16 @@ def build_upstream_headers(incoming: Request, api_key: str) -> dict:
         h["X-Api-Key"] = api_key
     else:
         h["Authorization"] = f"Bearer {api_key}"
-    if HTTP_REFERER:
-        h["HTTP-Referer"] = HTTP_REFERER
-    if X_TITLE:
-        h["X-Title"] = X_TITLE
+    referer, title = HTTP_REFERER, X_TITLE
+    if site_id is not None:
+        s = sites.get_site(site_id)
+        if s:
+            referer = s.get("referer") or HTTP_REFERER
+            title = s.get("title") or X_TITLE
+    if referer:
+        h["HTTP-Referer"] = referer
+    if title:
+        h["X-Title"] = title
     return h
 
 
@@ -941,7 +996,8 @@ async def proxy_request(request: Request):
                 )
             tried += 1
             upstream_url = f"{sites.resolve(sid)}{suffix}"
-            headers = build_upstream_headers(request, ks.key)
+            headers = build_upstream_headers(request, ks.key, sid)
+            timeout = site_timeout(sid)
 
             if want_stream:
                 # Ask upstream for exact token counts in the stream itself
@@ -961,7 +1017,7 @@ async def proxy_request(request: Request):
                 # Streaming needs its OWN client owned by the generator below.
                 # The shared client above closes when this function returns,
                 # which used to cut streams mid-response (interruptions).
-                sclient = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC)
+                sclient = httpx.AsyncClient(timeout=timeout)
                 try:
                     sreq = sclient.build_request(request.method, upstream_url, content=body_out, headers=headers)
                     sresp = await sclient.send(sreq, stream=True)
@@ -1011,6 +1067,7 @@ async def proxy_request(request: Request):
                     upstream_url,
                     content=body,
                     headers=headers,
+                    timeout=timeout,
                 )
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"

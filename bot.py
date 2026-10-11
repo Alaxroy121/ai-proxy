@@ -36,6 +36,9 @@ COMMAND_MENU = [
     ("siteuse", "Fix website URL: /siteuse <V1> <url>"),
     ("siteswap", "Swap two sites: /siteswap <V1> <V2>"),
     ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
+    ("sitelimit", "Site token budget: /sitelimit <V1> <n>"),
+    ("sitetimeout", "Site timeout: /sitetimeout <V1> <sec>"),
+    ("siteheaders", "Site headers: /siteheaders <V1> <ref> <title>"),
     ("siterm", "Remove website: /siterm <V1>"),
     ("add", "Add a key: /add <key> [V1]"),
     ("limit", "Token budget per key: /limit <num> <n>"),
@@ -60,6 +63,9 @@ HELP_TEXT = (
     "/siteuse <V1> – show a website's URL\n"
     "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
     "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
+    "/sitelimit <V1> <tokens> – default token budget on that site (0 = global)\n"
+    "/sitetimeout <V1> <sec> – request timeout on that site (0 = global)\n"
+    "/siteheaders <V1> <referer> <title…> – headers on that site (`-` = global)\n"
     "/siterm <V1> – remove website\n"
     "/add <full-key> [V1] – add key to a website (default: first site)\n"
     "/limit <num> <tokens> – token budget for one key (0 = global)\n"
@@ -179,7 +185,14 @@ async def render_sites(pool=None) -> str:
             sched = f" 🔁 {rh:g}h (next ~{hrs}h{mins:02d}m)"
         else:
             sched = ""
-        lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}")
+        bits = ""
+        if (s.get("token_budget") or 0) > 0:
+            bits += f" [lim {_fmt(s['token_budget'])}]"
+        if (s.get("timeout") or 0) > 0:
+            bits += f" [t/o {s['timeout']}s]"
+        if s.get("referer") or s.get("title"):
+            bits += " [H]"
+        lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}{bits}")
     return "🌐 *websites — all serve at once*\n" + "\n".join(lines or ["(none)"])
 
 
@@ -301,7 +314,18 @@ def render_stats(pool, site_filter=None) -> str:
 def render_config(pool=None) -> str:
     import app as appmod
     store = pool.store.label if pool is not None and pool.store else "file"
-    sitelines = "\n".join(f"  `{s['id']}` `{s['url']}`" for s in appmod.sites.sites) or "  (none)"
+    sitelines = []
+    for s in appmod.sites.sites:
+        bits = ""
+        if (s.get("token_budget") or 0) > 0:
+            bits += f" lim={_fmt(s['token_budget'])}"
+        if (s.get("timeout") or 0) > 0:
+            bits += f" t/o={s['timeout']}s"
+        if s.get("referer") or s.get("title"):
+            bits += " headers=custom"
+        n = sum(1 for k in (pool.keys if pool else []) if k.site == s["id"])
+        sitelines.append(f"  `{s['id']}` `{s['url']}` ({n} keys){bits}")
+    sitelines = "\n".join(sitelines) or "  (none)"
     return (
         "⚙️ *config*\n"
         f"mode: all sites serve at once (X-Site pins one)\n"
@@ -777,6 +801,48 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown site or last one).")
 
 
+async def cmd_sitelimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
+        return await update.message.reply_text("Usage: /sitelimit <V1> <tokens>  e.g. /sitelimit V1 50000 (0 = global default)")
+    import app as appmod
+    ok = await appmod.sites.configure_site(ctx.args[0], token_budget=int(ctx.args[1]))
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.")
+    await update.message.reply_text(
+        f"⚙️ Default token budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
+async def cmd_sitetimeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
+        return await update.message.reply_text("Usage: /sitetimeout <V1> <seconds>  e.g. /sitetimeout V1 90 (0 = global default)")
+    import app as appmod
+    ok = await appmod.sites.configure_site(ctx.args[0], timeout=int(ctx.args[1]))
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.")
+    await update.message.reply_text(
+        f"⚙️ Timeout on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1])}s`" + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
+async def cmd_siteheaders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) < 3:
+        return await update.message.reply_text("Usage: /siteheaders <V1> <referer> <title…>  (`-` keeps global)")
+    import app as appmod
+    ok = await appmod.sites.configure_site(ctx.args[0], referer=ctx.args[1], title=" ".join(ctx.args[2:]))
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.")
+    await update.message.reply_text(
+        f"⚙️ Headers on `{appmod.SiteManager.norm(ctx.args[0])}` updated." + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
 async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
@@ -1012,6 +1078,9 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("siteuse", cmd_siteuse))
     app.add_handler(CommandHandler("siteswap", cmd_siteswap))
     app.add_handler(CommandHandler("sitereset", cmd_sitereset))
+    app.add_handler(CommandHandler("sitelimit", cmd_sitelimit))
+    app.add_handler(CommandHandler("sitetimeout", cmd_sitetimeout))
+    app.add_handler(CommandHandler("siteheaders", cmd_siteheaders))
     app.add_handler(CommandHandler("siterm", cmd_siterm))
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
