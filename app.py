@@ -328,6 +328,20 @@ class KeyPool:
         await self._persist_keys()
         return masked
 
+    async def swap_key_sites(self, sa: str, sb: str) -> tuple:
+        """Move every key of site A to B and vice versa. Returns (moved_ab, moved_ba)."""
+        moved_ab = moved_ba = 0
+        async with self._lock:
+            for ks in self.keys:
+                if ks.site == sa:
+                    ks.site = sb
+                    moved_ab += 1
+                elif ks.site == sb:
+                    ks.site = sa
+                    moved_ba += 1
+        await self._persist_keys()
+        return moved_ab, moved_ba
+
     async def set_enabled(self, ident: str, enabled: bool) -> Optional[str]:
         async with self._lock:
             i = self._find_index(ident)
@@ -445,6 +459,8 @@ class SiteManager:
         self.active_id = "V1"
         self.store = None
         self._lock = asyncio.Lock()
+        self.last_save_ok = True
+        self.last_save_error = ""
 
     @staticmethod
     def norm(sid: str) -> str:
@@ -479,13 +495,26 @@ class SiteManager:
             if any(s["id"] == doc.get("active") for s in valid):
                 self.active_id = doc["active"]
 
-    async def _save(self):
+    async def _save(self) -> bool:
         if self.store is None:
-            return
+            self.last_save_ok = False
+            self.last_save_error = "no store attached"
+            return False
         try:
             await self.store.save_meta("sites", {"sites": self.sites, "active": self.active_id})
+            self.last_save_ok = True
+            self.last_save_error = ""
+            return True
         except Exception as e:
+            self.last_save_ok = False
+            self.last_save_error = str(e)[:150]
             print(f"[sites] save failed: {e}")
+            return False
+
+    def save_status_note(self) -> str:
+        if self.last_save_ok:
+            return ""
+        return f"\n⚠️ change NOT saved ({self.last_save_error}) — will vanish on restart"
 
     async def list_sites(self):
         async with self._lock:
@@ -510,6 +539,21 @@ class SiteManager:
             if not any(s["id"] == sid for s in self.sites):
                 return False
             self.active_id = sid
+        await self._save()
+        return True
+
+    async def swap_sites(self, sa: str, sb: str) -> bool:
+        """Exchange URL + reset schedule between two sites (ids + active stay)."""
+        sa, sb = self.norm(sa), self.norm(sb)
+        if sa == sb:
+            return False
+        async with self._lock:
+            a = next((s for s in self.sites if s["id"] == sa), None)
+            b = next((s for s in self.sites if s["id"] == sb), None)
+            if a is None or b is None:
+                return False
+            for field in ("url", "reset_hours", "last_reset"):
+                a[field], b[field] = b[field], a[field]
         await self._save()
         return True
 
@@ -678,6 +722,7 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     await pool.use_store(store)
     await sites.attach(store)
+    print(f"[sites] loaded: {[(s['id'], s['url']) for s in sites.sites]} active={sites.active_id}")
 
     async def _flusher():
         while True:

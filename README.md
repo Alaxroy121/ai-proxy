@@ -79,7 +79,7 @@ print(m.content[0].text)
   ```
 - Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
 - `/` menu not showing: the bot registers it itself on every boot
-  (watch `proxy.log` for `menu registered: 18 commands` + an `online`
+  (watch `proxy.log` for `menu registered: 19 commands` + an `online`
   DM). Shortcut: send `/menu` (or tap 📋 Menu) — it re-syncs live and
   tells you the result. If synced but invisible, fully close + reopen
   the Telegram chat (client caches the menu).
@@ -111,6 +111,8 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/sites` - list upstream websites (V1, V2, …)
 - `/siteadd <url>` / `/siteuse <V2>` / `/siterm <V1>` - manage websites live
   (clients can also pin one request via `X-Site: V2` header)
+- `/siteswap <V1> <V2>` - exchange the two sites' URLs, reset schedules
+  and keys (active site slot stays where it is)
 - `/sitereset <V1> <hours>` - auto-zero that website's counters every N
   hours (`0` = off). Each provider resets billing on its own cycle —
   match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.

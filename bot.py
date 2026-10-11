@@ -31,6 +31,7 @@ COMMAND_MENU = [
     ("sites", "List upstream websites V1, V2…"),
     ("siteadd", "Add website: /siteadd <url>"),
     ("siteuse", "Switch website: /siteuse <V1>"),
+    ("siteswap", "Swap two sites: /siteswap <V1> <V2>"),
     ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
     ("siterm", "Remove website: /siterm <V1>"),
     ("add", "Add a key: /add <key> [V1]"),
@@ -52,6 +53,7 @@ HELP_TEXT = (
     "/sites – list websites (V1, V2…)\n"
     "/siteadd <url> – add website\n"
     "/siteuse <V1> – switch active website\n"
+    "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
     "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
     "/siterm <V1> – remove website\n"
     "/add <full-key> [V1] – add key to a website (default: active)\n"
@@ -388,7 +390,9 @@ async def _route_button(data: str, pool, ctx):
     if data.startswith("siteuse:"):
         import app as appmod
         ok = await appmod.sites.use_site(data.split(":", 1)[1])
-        text = await render_sites() if ok else "❓ Unknown site."
+        if not ok:
+            return "❓ Unknown site.", await sites_keyboard()
+        text = await render_sites() + appmod.sites.save_status_note()
         return text, await sites_keyboard()
     if data == "reset:ask":
         return "⚠️ Zero *all* token/request counters?", RESET_CONFIRM_KEYBOARD
@@ -543,7 +547,36 @@ async def cmd_siteuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /siteuse <V1> (see /sites)")
     import app as appmod
     ok = await appmod.sites.use_site(ctx.args[0])
-    await update.message.reply_text(f"🔀 Now serving `{ctx.args[0].upper()}`" if ok else "❓ Unknown site.", parse_mode="Markdown")
+    if not ok:
+        return await update.message.reply_text("❓ Unknown site.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🔀 Now serving `{ctx.args[0].upper()}`" + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
+async def cmd_siteswap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) != 2:
+        return await update.message.reply_text("Usage: /siteswap <V1> <V2> — exchange URLs, schedules and keys")
+    import app as appmod
+    sa = appmod.SiteManager.norm(ctx.args[0])
+    sb = appmod.SiteManager.norm(ctx.args[1])
+    if sa == sb:
+        return await update.message.reply_text("❓ Pick two different sites.")
+    known = [s["id"] for s in appmod.sites.sites]
+    if sa not in known or sb not in known:
+        return await update.message.reply_text("❓ Unknown site. See /sites.")
+    ok = await appmod.sites.swap_sites(sa, sb)
+    if not ok:
+        return await update.message.reply_text("❓ Swap failed.")
+    pool = ctx.bot_data["pool"]
+    moved_ab, moved_ba = await pool.swap_key_sites(sa, sb)
+    await update.message.reply_text(
+        f"🔀 Swapped `{sa}` ⇄ `{sb}`: URLs, schedules and keys exchanged "
+        f"(`{moved_ab}` keys → `{sb}`, `{moved_ba}` keys → `{sa}`). "
+        f"Active site still `{appmod.sites.active_id}`." + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
 
 
 async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -790,6 +823,7 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("sites", cmd_sites))
     app.add_handler(CommandHandler("siteadd", cmd_siteadd))
     app.add_handler(CommandHandler("siteuse", cmd_siteuse))
+    app.add_handler(CommandHandler("siteswap", cmd_siteswap))
     app.add_handler(CommandHandler("sitereset", cmd_sitereset))
     app.add_handler(CommandHandler("siterm", cmd_siterm))
     if app.job_queue:
