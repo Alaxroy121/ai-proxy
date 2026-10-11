@@ -80,7 +80,7 @@ print(m.content[0].text)
   ```
 - Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
 - `/` menu not showing: the bot registers it itself on every boot
-  (watch `proxy.log` for `menu registered: 19 commands` + an `online`
+  (watch `proxy.log` for `menu registered: 20 commands` + an `online`
   DM). Shortcut: send `/menu` (or tap 📋 Menu) — it re-syncs live and
   tells you the result. If synced but invisible, fully close + reopen
   the Telegram chat (client caches the menu).
@@ -124,9 +124,9 @@ DM commands (also in the `/` menu + buttons under `/start`):
   A site can't be removed while keys point at it — `/rm` them first.
 - `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
-- `/limit <num> <tokens>` - token budget for one key (`0` = global default)
-- `/reqlimit <num> <n>` - request-count budget for one key (`0` = unlimited)
-- `/rm <num>` - remove key by number from `/stats`
+- `/limit <num> <tokens>` / `/reqlimit <num> <n>` / `/rm <num>` work fully
+  typed, or with no args open a guided flow: pick V1/V2 → pick key →
+  type the number (or confirm delete). `/cancel` aborts.
 - `/enable <num>` / `/disable <num>` - manual on/off
 - `/reset` - zero all token counters
 - Buttons: 📊 Stats first asks V1/V2/All, then per-site numbers with

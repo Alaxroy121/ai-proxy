@@ -18,7 +18,10 @@ Auto-alerts every 30s: key hit budget / all keys over budget.
 import os
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+PENDING_TTL = 300  # seconds to reply with a budget number
+GUIDED_ACTIONS = ("limit", "reqlimit", "rm")
 
 ADMIN_IDS = {s.strip() for s in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if s.strip()}
 MILESTONES = (50, 80, 100)  # live progress pushes when a key crosses these %
@@ -41,6 +44,7 @@ COMMAND_MENU = [
     ("enable", "Re-enable a key: /enable <num>"),
     ("disable", "Take a key offline: /disable <num>"),
     ("reset", "Zero all token counters"),
+    ("cancel", "Cancel a pending input"),
     ("menu", "Re-sync the / command menu now"),
     ("help", "All commands"),
 ]
@@ -64,6 +68,7 @@ HELP_TEXT = (
     "/enable <num> – re-enable key\n"
     "/disable <num> – take key offline\n"
     "/reset – zero all token counters\n"
+    "/limit, /reqlimit, /rm with no args – guided: pick site, pick key\n"
     "/menu – force re-sync of this / menu\n"
     "📈 Live: auto-push at 50/80/100% per key."
 )
@@ -326,7 +331,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id if update.effective_user else "?"
         print(f"[bot] button '{data}' from {uid}")
-        text, kb = await _route_button(data, pool, ctx)
+        text, kb = await _route_button(data, pool, ctx, update)
     except Exception as e:
         print(f"[bot] button '{data}' failed: {e}")
         text, kb = f"❌ Button failed: `{e}`\nTry again or use the typed command.", MAIN_KEYBOARD
@@ -336,7 +341,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         print(f"[bot] edit failed: {e}")
 
 
-async def _route_button(data: str, pool, ctx):
+async def _route_button(data: str, pool, ctx, update=None):
     """Returns (text, keyboard). Raises on failure (caller shows it)."""
     if data == "panel":
         return panel_text(pool), MAIN_KEYBOARD
@@ -402,6 +407,63 @@ async def _route_button(data: str, pool, ctx):
         return "♻️ Counters zeroed.\n\n" + render_stats(pool), stats_keyboard(pool)
     if data == "reset:no":
         return render_stats(pool), stats_keyboard(pool)
+    for _act in ("limit", "reqlimit", "rm"):
+        if data == f"guided:{_act}":
+            titles = {"limit": "⚙️ Token budget", "reqlimit": "⚙️ Request budget", "rm": "🗑 Remove a key"}
+            return titles[_act] + " — pick a website:", await action_site_keyboard(pool, _act)
+    for _act in ("limit", "reqlimit", "rm"):
+        if data.startswith(f"{_act}site:"):
+            sid = data.split(":", 1)[1]
+            import app as _appmod
+            if sid not in [s["id"] for s in _appmod.sites.sites]:
+                return "❓ Unknown site.", await action_site_keyboard(pool, _act)
+            nouns = {"limit": "token budget", "reqlimit": "request budget", "rm": "removal"}
+            return (f"*{nouns[_act].title()}* — pick a key on `{sid}`:",
+                    await action_key_keyboard(pool, _act, sid))
+    for _act in ("limit", "reqlimit"):
+        if data.startswith(f"{_act}key:"):
+            parts = data.split(":")
+            num = parts[1] if len(parts) > 2 else ""
+            site = parts[2] if len(parts) > 2 else ""
+            import time
+            i = pool._find_index(num)
+            if i is None:
+                return "❓ Key not found.", await action_key_keyboard(pool, _act, site)
+            ks = pool.keys[i]
+            uid = (update.effective_user.id if update is not None and update.effective_user else 0)
+            ctx.bot_data.setdefault("pending", {})[uid] = {
+                "action": _act, "key": ks.key, "site": site, "ts": time.time()}
+            noun = "token budget" if _act == "limit" else "request budget"
+            return (f"✏️ Reply with the {noun} number for `{ks.masked}` "
+                    f"(`0` = {'global default' if _act == 'limit' else 'unlimited'}), or /cancel.",
+                    CANCEL_KEYBOARD)
+    if data.startswith("rmkey:"):
+        parts = data.split(":")
+        num = parts[1] if len(parts) > 2 else ""
+        site = parts[2] if len(parts) > 2 else ""
+        i = pool._find_index(num)
+        if i is None:
+            return "❓ Key not found.", await action_key_keyboard(pool, "rm", site)
+        ks = pool.keys[i]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, delete", callback_data=f"rmyes:{num}:{site}"),
+             InlineKeyboardButton("❌ Keep", callback_data=f"rmno:{site}")],
+        ])
+        return f"⚠️ Delete `{ks.masked}`?", kb
+    if data.startswith("rmyes:"):
+        parts = data.split(":")
+        num = parts[1] if len(parts) > 2 else ""
+        site = parts[2] if len(parts) > 2 else ""
+        masked = await pool.remove_key(num)
+        text = (f"🗑 Removed `{masked}`." if masked else "❓ Key not found.") + "\n\n" + render_stats(pool, site or None)
+        return text, await action_key_keyboard(pool, "rm", site) if site else stats_keyboard(pool)
+    if data.startswith("rmno:"):
+        site = data.split(":", 1)[1]
+        return render_stats(pool, site or None), stats_keyboard(pool, site or None)
+    if data == "cancel:":
+        uid = (update.effective_user.id if update is not None and update.effective_user else 0)
+        ctx.bot_data.get("pending", {}).pop(uid, None)
+        return "Cancelled.", MAIN_KEYBOARD
     return HELP_TEXT, MAIN_KEYBOARD
 
 
@@ -476,9 +538,92 @@ async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if not ctx.args:
-        return await update.message.reply_text("Usage: /rm <num|masked> (see /stats)")
+        return await update.message.reply_text("🗑 Remove a key — pick a website first:",
+                                               parse_mode="Markdown",
+                                               reply_markup=await action_site_keyboard(ctx.bot_data["pool"], "rm"))
     masked = await ctx.bot_data["pool"].remove_key(ctx.args[0])
     await update.message.reply_text(f"🗑 Removed `{masked}`" if masked else "❓ Not found.", parse_mode="Markdown")
+
+
+async def action_site_keyboard(pool, action: str) -> InlineKeyboardMarkup:
+    """Site picker starting a guided flow (limit / reqlimit / rm)."""
+    import app as appmod
+    rows = []
+    for s in await appmod.sites.list_sites():
+        n = sum(1 for k in pool.keys if k.site == s["id"])
+        rows.append([InlineKeyboardButton(f"🌐 {s['id']} ({n} keys)",
+                                          callback_data=f"{action}site:{s['id']}")])
+    rows.append([HOME_BUTTON])
+    return InlineKeyboardMarkup(rows)
+
+
+async def action_key_keyboard(pool, action: str, site: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, ks in enumerate(pool.keys, start=1):
+        if ks.site != site:
+            continue
+        icon = "⛔" if ks.disabled else ("❌" if ks.over_budget() else "✅")
+        row.append(InlineKeyboardButton(f"{i} {icon} {ks.masked}", callback_data=f"{action}key:{i}:{site}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🌐 Websites", callback_data=f"guided:{action}"),
+                 HOME_BUTTON])
+    return InlineKeyboardMarkup(rows)
+
+
+CANCEL_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("❌ Cancel", callback_data="cancel:")],
+])
+
+
+def pending_for(ctx, uid):
+    return ctx.bot_data.get("pending", {}).get(uid)
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is not None and ctx.bot_data.get("pending", {}).pop(uid, None) is not None:
+        await update.message.reply_text("Cancelled.")
+    else:
+        await update.message.reply_text("Nothing pending.")
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Completes a guided limit/reqlimit flow with the typed number."""
+    import time
+    if not update.message or not update.message.text:
+        return
+    if not _is_admin(update):
+        return
+    uid = update.effective_user.id
+    pend = pending_for(ctx, uid)
+    if not pend:
+        return
+    if time.time() - pend.get("ts", 0) > PENDING_TTL:
+        ctx.bot_data["pending"].pop(uid, None)
+        await update.message.reply_text("⌛ Expired — start again with /limit or /reqlimit.")
+        return
+    txt = update.message.text.strip().replace(",", "").replace(" ", "")
+    if not txt.isdigit():
+        await update.message.reply_text("❓ Send a plain number, or /cancel.")
+        return
+    pool = ctx.bot_data["pool"]
+    if pend["action"] == "limit":
+        masked = await pool.set_token_limit(pend["key"], int(txt))
+        what = "Token budget"
+    else:
+        masked = await pool.set_req_limit(pend["key"], int(txt))
+        what = "Request budget"
+    ctx.bot_data["pending"].pop(uid, None)
+    if not masked:
+        await update.message.reply_text("❓ That key is gone. Start again.")
+        return
+    await update.message.reply_text(f"⚙️ {what} for `{masked}`: `{int(txt):,}`", parse_mode="Markdown")
 
 
 async def cmd_enable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -510,19 +655,48 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /limit <num> <tokens>  e.g. /limit 1 50000 (0 = global)")
-    masked = await ctx.bot_data["pool"].set_token_limit(ctx.args[0], int(ctx.args[1]))
-    await update.message.reply_text(f"⚙️ Token budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+    if len(ctx.args) == 2 and ctx.args[1].isdigit():
+        masked = await ctx.bot_data["pool"].set_token_limit(ctx.args[0], int(ctx.args[1]))
+        await update.message.reply_text(f"⚙️ Token budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+        return
+    if len(ctx.args) == 1:
+        return await _begin_guided(update, ctx, "limit", ctx.args[0])
+    await update.message.reply_text("⚙️ Token budget — pick a website first (or type `/limit <num> <tokens>`):",
+                                    parse_mode="Markdown",
+                                    reply_markup=await action_site_keyboard(ctx.bot_data["pool"], "limit"))
 
 
 async def cmd_reqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /reqlimit <num> <requests>  e.g. /reqlimit 1 500 (0 = unlimited)")
-    masked = await ctx.bot_data["pool"].set_req_limit(ctx.args[0], int(ctx.args[1]))
-    await update.message.reply_text(f"⚙️ Request budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+    if len(ctx.args) == 2 and ctx.args[1].isdigit():
+        masked = await ctx.bot_data["pool"].set_req_limit(ctx.args[0], int(ctx.args[1]))
+        await update.message.reply_text(f"⚙️ Request budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+        return
+    if len(ctx.args) == 1:
+        return await _begin_guided(update, ctx, "reqlimit", ctx.args[0])
+    await update.message.reply_text("⚙️ Request budget — pick a website first (or type `/reqlimit <num> <n>`):",
+                                    parse_mode="Markdown",
+                                    reply_markup=await action_site_keyboard(ctx.bot_data["pool"], "reqlimit"))
+
+
+async def _begin_guided(update, ctx, action: str, ident: str):
+    """Jump straight to the value prompt when the key is already known."""
+    import time
+    pool = ctx.bot_data["pool"]
+    i = pool._find_index(ident)
+    if i is None:
+        await update.message.reply_text("❓ Key not found. See /stats.")
+        return
+    ks = pool.keys[i]
+    uid = update.effective_user.id
+    ctx.bot_data.setdefault("pending", {})[uid] = {
+        "action": action, "key": ks.key, "site": ks.site, "ts": time.time()}
+    noun = "token budget" if action == "limit" else "request budget"
+    await update.message.reply_text(
+        f"✏️ Reply with the {noun} number for `{ks.masked}` (`0` = "
+        f"{'global default' if action == 'limit' else 'unlimited'}), or /cancel.",
+        parse_mode="Markdown", reply_markup=CANCEL_KEYBOARD)
 
 
 async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -829,6 +1003,8 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("disable", cmd_disable))
     app.add_handler(CommandHandler(["reset", "resetusage"], cmd_reset))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CommandHandler("limit", cmd_limit))
     app.add_handler(CommandHandler("reqlimit", cmd_reqlimit))
     app.add_handler(CommandHandler("sites", cmd_sites))
