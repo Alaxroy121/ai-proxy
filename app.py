@@ -31,13 +31,12 @@ X_TITLE = os.getenv("X_TITLE", "Key Rotating Proxy")
 MAX_TOKENS_PER_KEY = int(os.getenv("MAX_TOKENS_PER_KEY", "0"))
 MAX_RETRIES_PER_REQUEST = int(os.getenv("MAX_RETRIES_PER_REQUEST", "10"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "120"))
-KEYS_FILE = os.getenv("KEYS_FILE", "keys.txt")  # one full key per line, persists Telegram-added keys
-USAGE_WAL = os.getenv("USAGE_WAL", "usage.wal")  # local write-ahead log for usage deltas
-FLUSH_SEC = int(os.getenv("FLUSH_SEC", "5"))  # outbox -> store interval
+KEYS_FILE = os.getenv("KEYS_FILE", "keys.txt")
+USAGE_WAL = os.getenv("USAGE_WAL", "usage.wal")
+FLUSH_SEC = int(os.getenv("FLUSH_SEC", "5"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_IDS = [s.strip() for s in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if s.strip()]
 
-# Status codes / messages that mean "this key is dead, try next key"
 EXHAUSTED_MARKERS = [
     "insufficient",
     "credit",
@@ -77,10 +76,10 @@ class KeyState:
     tokens_used: int = 0
     cached_tokens: int = 0
     req_used: int = 0
-    req_limit: int = 0  # 0 = unlimited requests
-    token_limit: int = 0  # 0 = use global MAX_TOKENS_PER_KEY
-    site: str = "V1"  # which website (upstream) this key belongs to
-    disabled: bool = False  # manual off via Telegram
+    req_limit: int = 0
+    token_limit: int = 0
+    site: str = "V1"
+    disabled: bool = False
 
     def __post_init__(self):
         k = self.key
@@ -92,11 +91,18 @@ class KeyState:
         sb = site_token_budget(self.site)
         return sb if sb > 0 else MAX_TOKENS_PER_KEY
 
+    def eff_req_limit(self) -> int:
+        if self.req_limit > 0:
+            return self.req_limit
+        sb = site_req_budget(self.site)
+        return sb if sb > 0 else 0
+
     def over_budget(self) -> bool:
         tlim = self.eff_token_limit()
         if tlim > 0 and self.tokens_used >= tlim:
             return True
-        if self.req_limit > 0 and self.req_used >= self.req_limit:
+        rlim = self.eff_req_limit()
+        if rlim > 0 and self.req_used >= rlim:
             return True
         return False
 
@@ -106,12 +112,7 @@ class KeyState:
 
 
 class Outbox:
-    """Usage deltas wait here (memory + local WAL) until flushed to the store.
-
-    Memory counters on KeyState are always exact; the store catches up every
-    FLUSH_SEC seconds. A crash loses at most one flush window (WAL replays
-    the rest on boot). Nothing here ever raises into request handling.
-    """
+    """Usage deltas wait here (memory + local WAL) until flushed to the store."""
 
     def __init__(self, wal):
         self.wal = wal
@@ -150,7 +151,6 @@ class Outbox:
         return self.ops
 
     async def flush(self, store) -> bool:
-        """Push coalesced deltas (one store write per key). True if all ok."""
         if not self.pending:
             return True
         ok = True
@@ -165,18 +165,16 @@ class Outbox:
                 print(f"[outbox] flush {key} failed: {ex}")
                 ok = False
         if ok:
-            self.wal.clear()  # everything durable -> log can go
+            self.wal.clear()
         return ok
 
 
 class KeyPool:
-    """Fill-then-shift: stick to one key until its budget is full, then shift."""
-
     def __init__(self, keys: List[str]):
         self.keys: List[KeyState] = [KeyState(k) for k in keys]
         self._current = 0
         self._lock = asyncio.Lock()
-        self.store = None  # attached in lifespan (file or mongo)
+        self.store = None
         from store import UsageWal
         self.wal = UsageWal(USAGE_WAL)
         self.outbox = Outbox(self.wal)
@@ -185,7 +183,6 @@ class KeyPool:
 
     async def reload(self, keys: List[str]):
         async with self._lock:
-            # keep stats for existing keys, add new ones
             existing = {k.key: k for k in self.keys}
             self.keys = [existing.get(k, KeyState(k)) for k in keys]
             self._current = 0
@@ -196,7 +193,6 @@ class KeyPool:
         return len(self.keys)
 
     async def _scan_locked(self, site_id: Optional[str] = None) -> Optional[KeyState]:
-        """First available key from _current onward, optionally for one site."""
         n = len(self.keys)
         if n == 0:
             return None
@@ -210,12 +206,10 @@ class KeyPool:
         return None
 
     async def next_key(self, site_id: Optional[str] = None) -> Optional[KeyState]:
-        """Current key of a site until its budget is full, then shift within the site."""
         async with self._lock:
             return await self._scan_locked(site_id)
 
     async def advance_past(self, bad: KeyState, site_id: Optional[str] = None) -> Optional[KeyState]:
-        """Skip a just-failed key and shift to the next available one (same site)."""
         async with self._lock:
             n = len(self.keys)
             for i, ks in enumerate(self.keys):
@@ -230,8 +224,7 @@ class KeyPool:
             ks.req_used += 1
             ks.tokens_used += max(0, tokens)
             ks.cached_tokens += max(0, cached)
-        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached),
-                        success=1, reqs=1)
+        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached), success=1, reqs=1)
 
     async def add_usage(self, ks: KeyState, tokens: int, cached: int = 0):
         async with self._lock:
@@ -245,7 +238,6 @@ class KeyPool:
         self.outbox.add(ks.key, fails=1)
 
     async def set_token_limit(self, ident: str, limit: int) -> Optional[str]:
-        """Per-key token budget (0 = fall back to global). Persists immediately."""
         async with self._lock:
             i = self._find_index(ident)
             if i is None:
@@ -260,7 +252,6 @@ class KeyPool:
         return masked
 
     async def set_req_limit(self, ident: str, limit: int) -> Optional[str]:
-        """Per-key request-count budget (0 = unlimited). Persists immediately."""
         async with self._lock:
             i = self._find_index(ident)
             if i is None:
@@ -287,6 +278,7 @@ class KeyPool:
                 "custom_limit": ks.token_limit,
                 "req_used": ks.req_used,
                 "req_limit": ks.req_limit,
+                "eff_req_limit": ks.eff_req_limit(),
                 "over_budget": ks.over_budget(),
                 "disabled": ks.disabled,
                 "success": ks.success,
@@ -299,7 +291,6 @@ class KeyPool:
         return self.outbox.depth()
 
     async def add_key(self, key: str, site: str = "V1") -> bool:
-        """Append key to a site. Returns False if already present."""
         key = key.strip()
         async with self._lock:
             if any(k.key == key for k in self.keys):
@@ -310,12 +301,10 @@ class KeyPool:
 
     def _find_index(self, ident: str) -> Optional[int]:
         ident = ident.strip()
-        # 1-based index?
         if ident.isdigit():
             i = int(ident) - 1
             if 0 <= i < len(self.keys):
                 return i
-        # masked/full/suffix match
         for i, ks in enumerate(self.keys):
             if ident == ks.key or ident == ks.masked or ident in ks.key or ident in ks.masked:
                 return i
@@ -332,7 +321,6 @@ class KeyPool:
         return masked
 
     async def swap_key_sites(self, sa: str, sb: str) -> tuple:
-        """Move every key of site A to B and vice versa. Returns (moved_ab, moved_ba)."""
         moved_ab = moved_ba = 0
         async with self._lock:
             for ks in self.keys:
@@ -357,7 +345,6 @@ class KeyPool:
         return masked
 
     async def reset_usage(self, site_id: Optional[str] = None):
-        """Zero counters globally, or for one website only."""
         async with self._lock:
             for ks in self.keys:
                 if site_id is not None and ks.site != site_id:
@@ -379,7 +366,6 @@ class KeyPool:
         await self.reset_usage()
 
     async def use_store(self, store):
-        """Attach persistence and adopt its keys/counters (mongo wins if non-empty)."""
         self.store = store
         try:
             docs = await store.load()
@@ -407,7 +393,6 @@ class KeyPool:
                         ks.disabled = bool(d["disabled"])
                     merged.append(ks)
                 self.keys = merged
-        # Replay any deltas that never reached the store (crash window).
         replayed = self.wal.take_all()
         if replayed:
             by_key: Dict[str, KeyState] = {k.key: k for k in self.keys}
@@ -447,16 +432,14 @@ class KeyPool:
 pool = KeyPool(load_keys_list())
 if not Path(KEYS_FILE).exists() and pool.size:
     try:
-        save_keys_list([k.key for k in pool.keys])  # seed keys.txt from env on first run
+        save_keys_list([k.key for k in pool.keys])
     except Exception:
         pass
 
-tg_app = None  # telegram Application, set in lifespan when enabled
+tg_app = None
 
 
 class SiteManager:
-    """Multiple upstream websites, each V1, V2, ... Telegram-switchable."""
-
     def __init__(self, default_url: str):
         self.sites = [self._blank("V1", default_url)]
         self._cursor = 0
@@ -468,7 +451,7 @@ class SiteManager:
     @staticmethod
     def _blank(sid: str, url: str) -> dict:
         return {"id": sid, "url": url, "reset_hours": 0, "last_reset": 0.0,
-                "token_budget": 0, "timeout": 0, "referer": "", "title": ""}
+                "token_budget": 0, "req_budget": 0, "timeout": 0, "referer": "", "title": ""}
 
     @staticmethod
     def norm(sid: str) -> str:
@@ -497,6 +480,7 @@ class SiteManager:
                           "reset_hours": float(s.get("reset_hours") or 0),
                           "last_reset": float(s.get("last_reset") or 0),
                           "token_budget": int(s.get("token_budget") or 0),
+                          "req_budget": int(s.get("req_budget") or 0),
                           "timeout": int(s.get("timeout") or 0),
                           "referer": s.get("referer") or "",
                           "title": s.get("title") or ""})
@@ -531,13 +515,11 @@ class SiteManager:
             return [dict(s) for s in self.sites]
 
     async def advance(self):
-        """Move the rotation cursor one step (one step per request)."""
         async with self._lock:
             if self.sites:
                 self._cursor = (self._cursor + 1) % len(self.sites)
 
     async def ordered_ids(self):
-        """Site ids starting at the cursor — request rotation order."""
         async with self._lock:
             n = len(self.sites)
             if n == 0:
@@ -545,7 +527,6 @@ class SiteManager:
             return [self.sites[(self._cursor + i) % n]["id"] for i in range(n)]
 
     async def take_order(self):
-        """Snapshot rotation order AND advance, atomically (one call per request)."""
         async with self._lock:
             n = len(self.sites)
             if n == 0:
@@ -568,7 +549,6 @@ class SiteManager:
         return nid
 
     async def set_url(self, sid: str, url: str) -> bool:
-        """Fix/change a website's upstream URL."""
         sid = self.norm(sid)
         url = (url or "").strip().rstrip("/")
         if not url.startswith("http"):
@@ -582,7 +562,6 @@ class SiteManager:
         return True
 
     async def swap_sites(self, sa: str, sb: str) -> bool:
-        """Exchange URL + reset schedule between two sites."""
         sa, sb = self.norm(sa), self.norm(sb)
         if sa == sb:
             return False
@@ -592,13 +571,12 @@ class SiteManager:
             if a is None or b is None:
                 return False
             for field in ("url", "reset_hours", "last_reset",
-                          "token_budget", "timeout", "referer", "title"):
+                          "token_budget", "req_budget", "timeout", "referer", "title"):
                 a[field], b[field] = b[field], a[field]
         await self._save()
         return True
 
     async def set_reset(self, sid: str, hours: float) -> bool:
-        """Auto-reset schedule for one website's counters (0 = off)."""
         sid = self.norm(sid)
         async with self._lock:
             hit = next((s for s in self.sites if s["id"] == sid), None)
@@ -622,9 +600,8 @@ class SiteManager:
         sid = self.norm(sid)
         return next((s for s in self.sites if s["id"] == sid), None)
 
-    async def configure_site(self, sid: str, token_budget=None, timeout=None,
+    async def configure_site(self, sid: str, token_budget=None, req_budget=None, timeout=None,
                              referer=None, title=None) -> bool:
-        """Per-website settings. Budgets/timeouts 0 = global; referer/title '' = global."""
         sid = self.norm(sid)
         async with self._lock:
             hit = next((s for s in self.sites if s["id"] == sid), None)
@@ -632,6 +609,8 @@ class SiteManager:
                 return False
             if token_budget is not None:
                 hit["token_budget"] = max(0, int(token_budget))
+            if req_budget is not None:
+                hit["req_budget"] = max(0, int(req_budget))
             if timeout is not None:
                 hit["timeout"] = max(0, int(timeout))
             if referer is not None:
@@ -642,7 +621,6 @@ class SiteManager:
         return True
 
     def due_sites(self):
-        """Site IDs whose reset interval has elapsed."""
         import time
         now = time.time()
         return [s["id"] for s in self.sites
@@ -663,13 +641,11 @@ class SiteManager:
         return ok
 
     def resolve(self, override: Optional[str] = None) -> Optional[str]:
-        """URL for an explicit site override (None when unknown/no override)."""
         if not override:
             return None
         return self.pick(override)[1]
 
     def pick(self, override: Optional[str] = None):
-        """(site_id, url) for an explicit override; (None, None) without one."""
         if override:
             sid = self.norm(override)
             for s in self.sites:
@@ -683,26 +659,22 @@ sites = SiteManager(UPSTREAM_BASE_URL)
 
 
 def site_token_budget(site_id: str) -> int:
-    """Default token budget for a site's keys (0 = global). Key overrides win."""
     s = sites.get_site(site_id)
     return int((s or {}).get("token_budget") or 0)
 
 
+def site_req_budget(site_id: str) -> int:
+    s = sites.get_site(site_id)
+    return int((s or {}).get("req_budget") or 0)
+
+
 def site_timeout(site_id: str) -> int:
-    """Request timeout for a site (0 = global)."""
     s = sites.get_site(site_id)
     t = int((s or {}).get("timeout") or 0)
     return t if t > 0 else REQUEST_TIMEOUT_SEC
 
 
 def extract_usage(data) -> tuple:
-    """(counted_tokens, cached_tokens) from an upstream response body.
-
-    Cached tokens are counted ON TOP (the platform bills them), taken from
-    OpenAI-style `prompt_tokens_details.cached_tokens`, Anthropic-style
-    `cache_read_input_tokens` / `cache_creation_input_tokens`, or the
-    generic `cached_tokens` / `prompt_cache_hit_tokens` fields.
-    """
     if not isinstance(data, dict):
         return 0, 0
     u = data.get("usage") or {}
@@ -726,7 +698,6 @@ _USAGE_KEYS = ("total_tokens", "input_tokens", "prompt_tokens",
 
 
 def _find_usage(obj):
-    """First usage-like dict in a parsed JSON body (OpenAI + Anthropic)."""
     if isinstance(obj, dict):
         u = obj.get("usage")
         if isinstance(u, dict) and any(k in u for k in _USAGE_KEYS):
@@ -744,7 +715,6 @@ def _find_usage(obj):
 
 
 def _usage_from_text(text: bytes):
-    """Last envelope object containing usage in a body/SSE stream."""
     try:
         raw = text.decode("utf-8", errors="replace")
     except Exception:
@@ -766,7 +736,6 @@ def _usage_from_text(text: bytes):
 
 
 def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> tuple:
-    """(tokens, cached): real usage when reported, else chars // 4 estimate."""
     total, cached = extract_usage(data)
     if total > 0:
         return total + cached, cached
@@ -775,7 +744,6 @@ def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> tuple:
 
 
 def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
-    """Usage chunk at stream end (exact, incl. cached); else estimate."""
     total, cached = extract_usage(_usage_from_text(stream_bytes))
     if total > 0:
         return total + cached, cached
@@ -785,7 +753,6 @@ def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tg_app
-    # Attach persistence first: mongo (survives unstable disk) or local file
     from store import FileStore, build_store
     store = build_store(KEYS_FILE)
     try:
@@ -828,7 +795,7 @@ async def lifespan(app: FastAPI):
     yield
     flush_task.cancel()
     try:
-        await pool.outbox.flush(store)  # final durable flush on clean shutdown
+        await pool.outbox.flush(store)
         pool.store_ok = True
     except Exception as e:
         pool.store_ok = False
@@ -852,9 +819,8 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 async def check_proxy_auth(request: Request,
                            cred: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
-    """Proxy credential via OpenAI-style Bearer OR Anthropic-style x-api-key."""
     if not PROXY_API_KEY:
-        return  # open proxy
+        return
     if cred is not None and cred.credentials == PROXY_API_KEY:
         return
     if request.headers.get("x-api-key") == PROXY_API_KEY:
@@ -866,7 +832,7 @@ def is_exhausted(status_code: int, body_text: str) -> bool:
     if status_code == 402:
         return True
     if status_code in (401, 403):
-        return True  # invalid key / no credits -> rotate anyway
+        return True
     low = body_text.lower()
     return any(m in low for m in EXHAUSTED_MARKERS)
 
@@ -888,14 +854,12 @@ def _wants_stream(request: Request, body: bytes) -> bool:
 
 def build_upstream_headers(incoming: Request, api_key: str, site_id: Optional[str] = None) -> dict:
     h = {}
-    # forward safe headers
     for k, v in incoming.headers.items():
         kl = k.lower()
         if kl in ("host", "authorization", "x-api-key", "content-length", "connection"):
             continue
         h[k] = v
     if any(k.lower() == "x-api-key" for k in incoming.headers.keys()):
-        # Anthropic SDK style: rotate the key into x-api-key
         h["X-Api-Key"] = api_key
     else:
         h["Authorization"] = f"Bearer {api_key}"
@@ -935,7 +899,6 @@ async def keys_status(_=Depends(check_proxy_auth)):
 
 @app.post("/keys/reload")
 async def keys_reload(_=Depends(check_proxy_auth)):
-    # re-read from env (useful if you update keys via env restart script)
     load_dotenv(override=True)
     await pool.reload(parse_keys(os.getenv("API_KEYS", "")))
     return {"reloaded": pool.size}
@@ -947,12 +910,10 @@ async def root():
 
 
 async def proxy_request(request: Request):
-    """All sites serve: rotate across V1, V2, … (X-Site pins one). Supports SSE streaming."""
     if pool.size == 0:
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
     body = await request.body()
-    # Site selection: X-Site: V2 header pins one site, else rotate across all.
     site_ov = (request.headers.get("x-site") or "").strip()
     site_id = None
     if site_ov:
@@ -961,8 +922,7 @@ async def proxy_request(request: Request):
             return JSONResponse(
                 status_code=400,
                 content={"error": f"unknown site '{site_ov}'. Use /sites in Telegram to list V1, V2, ..."})
-    # strip /v1 prefix handling: client calls /v1/chat/completions -> upstream same path
-    upstream_path = request.url.path  # e.g. /v1/chat/completions
+    upstream_path = request.url.path
     if request.url.query:
         upstream_path += f"?{request.url.query}"
     suffix = upstream_path[len("/v1"):] if upstream_path.startswith("/v1") else upstream_path
@@ -1000,8 +960,6 @@ async def proxy_request(request: Request):
             timeout = site_timeout(sid)
 
             if want_stream:
-                # Ask upstream for exact token counts in the stream itself
-                # (OpenAI-style `include_usage`), so budgets stay accurate.
                 body_out = body
                 if upstream_path == "/v1/chat/completions":
                     try:
@@ -1014,9 +972,6 @@ async def proxy_request(request: Request):
                                 body_out = json.dumps(payload).encode()
                     except Exception:
                         body_out = body
-                # Streaming needs its OWN client owned by the generator below.
-                # The shared client above closes when this function returns,
-                # which used to cut streams mid-response (interruptions).
                 sclient = httpx.AsyncClient(timeout=timeout)
                 try:
                     sreq = sclient.build_request(request.method, upstream_url, content=body_out, headers=headers)
@@ -1026,7 +981,7 @@ async def proxy_request(request: Request):
                     last_error = f"network error with {ks.masked}: {e}"
                     await pool.mark_failed(ks)
                     await pool.advance_past(ks, sid)
-                    continue  # shift to next key
+                    continue
                 if sresp.status_code >= 400:
                     raw = await sresp.aread()
                     await sresp.aclose()
@@ -1040,7 +995,7 @@ async def proxy_request(request: Request):
                     await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
                         await pool.advance_past(ks, sid)
-                        continue  # rate-limit / dead key / blip -> shift to next key
+                        continue
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
                 await pool.mark_success(ks)
@@ -1059,7 +1014,7 @@ async def proxy_request(request: Request):
                         await pool.add_usage(_k, *count_stream_tokens(_b, bytes(buf)))
 
                 return StreamingResponse(gen(), status_code=sresp.status_code,
-                                         media_type="text/event-stream")
+                                        media_type="text/event-stream")
 
             try:
                 resp = await client.request(
@@ -1073,17 +1028,13 @@ async def proxy_request(request: Request):
                 last_error = f"network error with {ks.masked}: {e}"
                 await pool.mark_failed(ks)
                 await pool.advance_past(ks, sid)
-                continue  # shift to next key
+                continue
 
-            ctype = resp.headers.get("content-type", "")
-
-            # Success -> record tokens, return JSON
             if resp.status_code < 400:
                 data = resp.json() if resp.content else {}
                 await pool.mark_success(ks, *count_tokens(body, resp.content, data))
                 return JSONResponse(status_code=resp.status_code, content=data)
 
-            # Failure -> next key in sequence (no cooldowns)
             try:
                 text = resp.text[:2000]
             except Exception:
@@ -1094,16 +1045,14 @@ async def proxy_request(request: Request):
 
             if _retryable(resp.status_code, text):
                 await pool.advance_past(ks, sid)
-                continue  # rate-limit / dead key / blip -> shift to next key
+                continue
 
-            # Real client error (400, 404, 422...) -> don't rotate further, return as-is
             return JSONResponse(status_code=resp.status_code, content={"error": text, "proxy_note": params_note})
 
     raise HTTPException(status_code=last_status if last_status != 502 else 503,
                         detail=f"All keys failed after {tried} tries. Last: {last_error}")
 
 
-# OpenAI-compatible routes (all go through same rotation logic)
 for _path in [
     "/v1/chat/completions",
     "/v1/completions",
