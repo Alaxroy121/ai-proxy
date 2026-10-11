@@ -58,7 +58,7 @@ HELP_TEXT = (
     "/health – totals + upstream\n"
     "/stats [V1] – keys grouped by website\n"
     "/config – budget, store & timeouts\n"
-    "/sites – list websites (V1, V2…)\n"
+    "/sites – list websites (V1, V2…); tip: /v2/… paths pin site V2\n"
     "/siteadd <url> – add website\n"
     "/siteuse <V1> <url> – fix a website's URL\n"
     "/siteuse <V1> – show a website's URL\n"
@@ -197,7 +197,8 @@ async def render_sites(pool=None) -> str:
         if s.get("referer") or s.get("title"):
             bits += " [H]"
         lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}{bits}")
-    return "🌐 *websites — all serve at once*\n" + "\n".join(lines or ["(none)"])
+    return "🌐 *websites — all serve at once*\n" + "\n".join(lines or ["(none)"]) + \
+        "\n\nTip: `/v2/chat/…` pins site V2, `/v1/…` rotates all."
 
 
 def _admin_ids() -> set:

@@ -7,6 +7,7 @@ provider errors.
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -813,7 +814,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.7.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.8.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -914,15 +915,40 @@ async def proxy_request(request: Request):
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
     body = await request.body()
-    site_ov = (request.headers.get("x-site") or "").strip()
+    # Site selection, precedence: X-Site header > /vN path prefix > rotate all.
+    # /v1/... stays the all-sites default; /v2/..., /v3/... pin that site.
+    raw_path = request.url.path
     site_id = None
+    m = re.match(r"^/[vV](\d+)(/.*)$", raw_path)
+    if m and m.group(1) != "1":
+        sid = "V" + m.group(1)
+        if sites.get_site(sid) is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"unknown site '{sid}'. Use /sites in Telegram to list V1, V2, ..."})
+        site_id = sid
+        raw_path = m.group(2)
+    else:
+        m_bare = re.match(r"^/[vV](\d+)$", raw_path)
+        if m_bare:
+            if m_bare.group(1) == "1":
+                raise HTTPException(status_code=404, detail="Not Found")
+            sid = "V" + m_bare.group(1)
+            if sites.get_site(sid) is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"unknown site '{sid}'. Use /sites in Telegram to list V1, V2, ..."})
+            return JSONResponse({"site": sid, "upstream": sites.resolve(sid),
+                                 "hint": f"append an endpoint path, e.g. /v{sid[1:]}/chat/completions"})
+    site_ov = (request.headers.get("x-site") or "").strip()
     if site_ov:
         site_id, base_url = sites.pick(site_ov)
         if base_url is None:
             return JSONResponse(
                 status_code=400,
                 content={"error": f"unknown site '{site_ov}'. Use /sites in Telegram to list V1, V2, ..."})
-    upstream_path = request.url.path
+    # strip /v1 prefix handling: client calls /v1/chat/completions -> upstream same path
+    upstream_path = raw_path  # e.g. /v1/chat/completions
     if request.url.query:
         upstream_path += f"?{request.url.query}"
     suffix = upstream_path[len("/v1"):] if upstream_path.startswith("/v1") else upstream_path
@@ -1065,4 +1091,13 @@ for _path in [
 
 app.add_api_route("/v1/models", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
 app.add_api_route("/v1/{full_path:path}", proxy_request, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                  dependencies=[Depends(check_proxy_auth)])
+# Site-pinned paths: /v2/chat/completions -> site V2 (/v1/* stays all-sites).
+app.add_api_route("/v{site}/{full_path:path}", proxy_request, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                  dependencies=[Depends(check_proxy_auth)])
+app.add_api_route("/v{site}", proxy_request, methods=["GET"],
+                  dependencies=[Depends(check_proxy_auth)])
+app.add_api_route("/V{site}/{full_path:path}", proxy_request, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                  dependencies=[Depends(check_proxy_auth)])
+app.add_api_route("/V{site}", proxy_request, methods=["GET"],
                   dependencies=[Depends(check_proxy_auth)])
