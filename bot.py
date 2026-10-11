@@ -30,7 +30,7 @@ COMMAND_MENU = [
     ("config", "Budget, store, timeouts"),
     ("sites", "List upstream websites V1, V2…"),
     ("siteadd", "Add website: /siteadd <url>"),
-    ("siteuse", "Switch website: /siteuse <V1>"),
+    ("siteuse", "Fix website URL: /siteuse <V1> <url>"),
     ("siteswap", "Swap two sites: /siteswap <V1> <V2>"),
     ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
     ("siterm", "Remove website: /siterm <V1>"),
@@ -52,11 +52,12 @@ HELP_TEXT = (
     "/config – budget, store & timeouts\n"
     "/sites – list websites (V1, V2…)\n"
     "/siteadd <url> – add website\n"
-    "/siteuse <V1> – switch active website\n"
+    "/siteuse <V1> <url> – fix a website's URL\n"
+    "/siteuse <V1> – show a website's URL\n"
     "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
     "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
     "/siterm <V1> – remove website\n"
-    "/add <full-key> [V1] – add key to a website (default: active)\n"
+    "/add <full-key> [V1] – add key to a website (default: first site)\n"
     "/limit <num> <tokens> – token budget for one key (0 = global)\n"
     "/reqlimit <num> <n> – request budget for one key (0 = unlimited)\n"
     "/rm <num|mask> – remove key\n"
@@ -88,8 +89,8 @@ def panel_text(pool) -> str:
     overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
     return (
         "🤖 *Proxy control panel*\n"
-        "Fill-then-shift: one key until its budget is full.\n"
-        f"🌐 `{appmod.sites.active_id}` active · 🔑 {avail}/{total} keys\n"
+        "All sites serve at once — requests rotate V1, V2, …\n"
+        f"🌐 `{', '.join(s['id'] for s in appmod.sites.sites) or 'none'}` · 🔑 {avail}/{total} keys\n"
         f"📊 overall {overall}\n"
         "📈 Live progress auto-pushes at 50/80/100%."
     )
@@ -125,13 +126,13 @@ def stats_keyboard(pool, site_id=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def stats_picker_keyboard() -> InlineKeyboardMarkup:
+async def stats_picker_keyboard(pool) -> InlineKeyboardMarkup:
     import app as appmod
     rows = []
     for s in await appmod.sites.list_sites():
-        mark = "🟢" if s.get("active") else "⚪"
-        rows.append([InlineKeyboardButton(f"{mark} {s['id']}", callback_data=f"statssite:{s['id']}")])
-    rows.append([InlineKeyboardButton("🌐 All sites", callback_data="statssite:ALL")])
+        n = sum(1 for k in pool.keys if k.site == s["id"])
+        rows.append([InlineKeyboardButton(f"🌐 {s['id']} ({n} keys)", callback_data=f"statssite:{s['id']}")])
+    rows.append([InlineKeyboardButton("🌍 All sites", callback_data="statssite:ALL")])
     rows.append([HOME_BUTTON])
     return InlineKeyboardMarkup(rows)
 
@@ -144,18 +145,10 @@ def health_keyboard() -> InlineKeyboardMarkup:
 
 
 async def sites_keyboard() -> InlineKeyboardMarkup:
-    import app as appmod
-    rows = []
-    for s in await appmod.sites.list_sites():
-        if s.get("active"):
-            rows.append([InlineKeyboardButton(f"✅ {s['id']} active", callback_data="noop")])
-        else:
-            rows.append([InlineKeyboardButton(f"▶️ Use {s['id']}", callback_data=f"siteuse:{s['id']}")])
-    rows.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
-        HOME_BUTTON,
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
+         HOME_BUTTON],
     ])
-    return InlineKeyboardMarkup(rows)
 
 
 RESET_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
@@ -164,12 +157,15 @@ RESET_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 
-async def render_sites() -> str:
+async def render_sites(pool=None) -> str:
     import app as appmod
     import time
     lines = []
     for s in await appmod.sites.list_sites():
-        mark = "🟢 active" if s.get("active") else "⚪"
+        nkeys = ""
+        if pool is not None:
+            n = sum(1 for k in pool.keys if k.site == s["id"])
+            nkeys = f" ({n} keys)"
         rh = s.get("reset_hours") or 0
         if rh > 0:
             left = max(0, rh * 3600 - (time.time() - (s.get("last_reset") or 0)))
@@ -178,8 +174,8 @@ async def render_sites() -> str:
             sched = f" 🔁 {rh:g}h (next ~{hrs}h{mins:02d}m)"
         else:
             sched = ""
-        lines.append(f"`{s['id']}` {mark} `{s['url']}`{sched}")
-    return "🌐 *websites*\n" + "\n".join(lines or ["(none)"]) + "\n\nTap a button to switch."
+        lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}")
+    return "🌐 *websites — all serve at once*\n" + "\n".join(lines or ["(none)"])
 
 
 def _admin_ids() -> set:
@@ -280,8 +276,8 @@ def render_stats(pool, site_filter=None) -> str:
         if sid == "?":
             title = "❓ *unknown site*"
         else:
-            mark = "🟢" if sid == appmod.sites.active_id else "⚪"
-            title = f"{mark} *{sid}* `{appmod.sites.resolve(sid) or '?'}`"
+            nkeys = len(items)
+            title = f"*{sid}* `{appmod.sites.resolve(sid) or '?'}`"
         used = sum(ks.tokens_used for _, ks in items)
         cap = sum(ks.eff_token_limit() for _, ks in items)
         overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
@@ -300,10 +296,11 @@ def render_stats(pool, site_filter=None) -> str:
 def render_config(pool=None) -> str:
     import app as appmod
     store = pool.store.label if pool is not None and pool.store else "file"
+    sitelines = "\n".join(f"  `{s['id']}` `{s['url']}`" for s in appmod.sites.sites) or "  (none)"
     return (
         "⚙️ *config*\n"
-        f"upstream: `{appmod.sites.resolve()}` (`{appmod.sites.active_id}`)\n"
-        f"mode: fill key 1 to budget, then shift to key 2, …\n"
+        f"mode: all sites serve at once (X-Site pins one)\n"
+        f"websites:\n{sitelines}\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"live milestones: `50/80/100%`\n"
         f"auto digest: `{os.getenv('LIVE_DIGEST_MIN', '0')} min (0 = off)`\n"
@@ -325,7 +322,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pool = ctx.bot_data["pool"]
     data = q.data or ""
     if data == "noop":
-        return  # active-site label button: nothing to do
+        return  # legacy label button: nothing to do
     try:
         uid = update.effective_user.id if update.effective_user else "?"
         print(f"[bot] button '{data}' from {uid}")
@@ -344,14 +341,14 @@ async def _route_button(data: str, pool, ctx):
     if data == "panel":
         return panel_text(pool), MAIN_KEYBOARD
     if data == "stats":
-        return "📊 *Stats — pick a website*", await stats_picker_keyboard()
+        return "📊 *Stats — pick a website*", await stats_picker_keyboard(pool)
     if data.startswith("statssite:"):
         sid = data.split(":", 1)[1]
         if sid == "ALL":
             return render_stats(pool), stats_keyboard(pool)
         import app as _appmod
         if sid not in [s["id"] for s in _appmod.sites.sites]:
-            return "❓ Unknown site.", await stats_picker_keyboard()
+            return "❓ Unknown site.", await stats_picker_keyboard(pool)
         return render_stats(pool, sid), stats_keyboard(pool, sid)
     if data == "health":
         return _make_health(pool), health_keyboard()
@@ -366,13 +363,13 @@ async def _route_button(data: str, pool, ctx):
                     "Tap `/` to see them (reopen chat if cached)."), MAIN_KEYBOARD
         return f"❌ Menu sync failed: `{info}`", MAIN_KEYBOARD
     if data == "sites":
-        return await render_sites(), await sites_keyboard()
+        return await render_sites(pool), await sites_keyboard()
     if data == "refresh:stats":
         return render_stats(pool), stats_keyboard(pool)
     if data == "refresh:health":
         return _make_health(pool), health_keyboard()
     if data == "refresh:sites":
-        return await render_sites(), await sites_keyboard()
+        return await render_sites(pool), await sites_keyboard()
     if data.startswith("tg:"):
         parts = data.split(":")
         num = parts[1] if len(parts) > 1 else ""
@@ -388,12 +385,15 @@ async def _route_button(data: str, pool, ctx):
         text = render_stats(pool) if masked else "❓ Key not found."
         return text, stats_keyboard(pool)
     if data.startswith("siteuse:"):
+        # Old "Use V2" buttons still floating in chat: show that site's info.
         import app as appmod
-        ok = await appmod.sites.use_site(data.split(":", 1)[1])
-        if not ok:
+        sid = appmod.SiteManager.norm(data.split(":", 1)[1])
+        hit = next((s for s in appmod.sites.sites if s["id"] == sid), None)
+        if hit is None:
             return "❓ Unknown site.", await sites_keyboard()
-        text = await render_sites() + appmod.sites.save_status_note()
-        return text, await sites_keyboard()
+        nkeys = sum(1 for k in pool.keys if k.site == sid)
+        return (f"`{sid}` → `{hit['url']}` ({nkeys} keys)\n"
+                f"Fix it: `/siteuse {sid} <new-url>`"), await sites_keyboard()
     if data == "reset:ask":
         return "⚠️ Zero *all* token/request counters?", RESET_CONFIRM_KEYBOARD
     if data == "reset:yes":
@@ -422,10 +422,11 @@ def _make_health(pool):
     budget = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
     pend = pool.pending_count()
     extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
+    ids = ", ".join(s["id"] for s in appmod.sites.sites) or "none"
     return (
         f"❤️ *health*\n"
-        f"upstream: `{appmod.sites.resolve()}` (`{appmod.sites.active_id}`)\n"
-        f"keys: {avail}/{total} in rotation\n"
+        f"sites: `{ids}` (all serve)\n"
+        f"keys: {avail}/{total} usable\n"
         f"tokens total: {budget}{extra}"
     )
 
@@ -457,9 +458,10 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if not ctx.args:
-        return await update.message.reply_text("Usage: /add <full-api-key> [V1] (site defaults to active)")
+        return await update.message.reply_text("Usage: /add <full-api-key> [V1] (site defaults to first)")
     import app as appmod
-    site = appmod.SiteManager.norm(ctx.args[1]) if len(ctx.args) > 1 else appmod.sites.active_id
+    default_site = appmod.sites.sites[0]["id"] if appmod.sites.sites else "V1"
+    site = appmod.SiteManager.norm(ctx.args[1]) if len(ctx.args) > 1 else default_site
     if site not in [s["id"] for s in appmod.sites.sites]:
         return await update.message.reply_text("❓ Unknown site. See /sites.")
     pool = ctx.bot_data["pool"]
@@ -526,7 +528,7 @@ async def cmd_reqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    await update.message.reply_text(await render_sites(),
+    await update.message.reply_text(await render_sites(ctx.bot_data["pool"]),
                                         parse_mode="Markdown", reply_markup=await sites_keyboard())
 
 
@@ -543,14 +545,24 @@ async def cmd_siteadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_siteuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 1:
-        return await update.message.reply_text("Usage: /siteuse <V1> (see /sites)")
     import app as appmod
-    ok = await appmod.sites.use_site(ctx.args[0])
-    if not ok:
-        return await update.message.reply_text("❓ Unknown site.", parse_mode="Markdown")
+    if len(ctx.args) == 2:
+        ok = await appmod.sites.set_url(ctx.args[0], ctx.args[1])
+        if not ok:
+            return await update.message.reply_text("❓ Unknown site or bad URL (must start with http).", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔗 `{appmod.SiteManager.norm(ctx.args[0])}` URL updated." + appmod.sites.save_status_note(),
+            parse_mode="Markdown")
+        return
+    if len(ctx.args) != 1:
+        return await update.message.reply_text("Usage: /siteuse <V1> <new-url> — or one arg to show it")
+    sid = appmod.SiteManager.norm(ctx.args[0])
+    hit = next((s for s in appmod.sites.sites if s["id"] == sid), None)
+    if hit is None:
+        return await update.message.reply_text("❓ Unknown site. See /sites.", parse_mode="Markdown")
+    nkeys = sum(1 for k in ctx.bot_data["pool"].keys if k.site == sid)
     await update.message.reply_text(
-        f"🔀 Now serving `{ctx.args[0].upper()}`" + appmod.sites.save_status_note(),
+        f"`{sid}` → `{hit['url']}` ({nkeys} keys)\nFix it: `/siteuse {sid} <new-url>`",
         parse_mode="Markdown")
 
 
@@ -574,8 +586,7 @@ async def cmd_siteswap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     moved_ab, moved_ba = await pool.swap_key_sites(sa, sb)
     await update.message.reply_text(
         f"🔀 Swapped `{sa}` ⇄ `{sb}`: URLs, schedules and keys exchanged "
-        f"(`{moved_ab}` keys → `{sb}`, `{moved_ba}` keys → `{sa}`). "
-        f"Active site still `{appmod.sites.active_id}`." + appmod.sites.save_status_note(),
+        f"(`{moved_ab}` keys → `{sb}`, `{moved_ba}` keys → `{sa}`)." + appmod.sites.save_status_note(),
         parse_mode="Markdown")
 
 
@@ -583,13 +594,13 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 1:
-        return await update.message.reply_text("Usage: /siterm <V1> (not the active one)")
+        return await update.message.reply_text("Usage: /siterm <V1> (can't remove the last one)")
     import app as appmod
     sid = appmod.SiteManager.norm(ctx.args[0])
     if any(ks.site == sid for ks in ctx.bot_data["pool"].keys):
         return await update.message.reply_text("❓ Site still has keys — /rm them first (see /stats).")
     ok = await appmod.sites.remove_site(ctx.args[0])
-    await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown, active, or last).")
+    await update.message.reply_text("🗑 Removed." if ok else "❓ Can't remove (unknown site or last one).")
 
 
 async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

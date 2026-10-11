@@ -1,14 +1,15 @@
 # AI Key-Rotating Proxy (OpenRouter / OpenAI-compatible)
 
-Strict 1→2→3 rotation + preemptive token budgets. One key serves every
-request until its `MAX_TOKENS_PER_KEY` budget is full — then traffic
-shifts to the next key. A key that errors is skipped the same way.
+Strict 1→2→3 rotation + preemptive token budgets. All websites serve
+at once: requests rotate V1, V2, … — each site spending only its own
+keys (one key to budget, then shift within that site).
 
 ## How it works
 - You give it N keys: `API_KEYS=key1,key2,key3`
 - Clients call **the proxy** instead of the provider directly:
   `POST http://YOUR-VPS:25007/v1/chat/completions`
-- All requests → key1 until key1's budget is full → all requests → key2 …
+- All requests rotate across sites → key1 of V1, key1 of V2, …; a site
+  whose keys are all over budget is skipped until `/reset`
 - If a key errors (402/401/429/5xx), the same request retries with the next key
 - Token counting: real `usage.total_tokens` when upstream reports it
   (streaming requests auto-add `stream_options.include_usage` so stream
@@ -105,19 +106,21 @@ Setup (2 min):
 
 DM commands (also in the `/` menu + buttons under `/start`):
 - `/start` - control panel: live status + buttons for everything below
-- `/health` - upstream + keys in rotation + tokens used
+- `/health` - sites + usable keys + tokens used
 - `/stats` - overall total bar + per-key usage bars (masked keys only)
 - `/config` - budget, timeouts, upstream, store backend
 - `/sites` - list upstream websites (V1, V2, …)
-- `/siteadd <url>` / `/siteuse <V2>` / `/siterm <V1>` - manage websites live
-  (clients can also pin one request via `X-Site: V2` header)
+- `/siteadd <url>` - register a website (all sites serve at once;
+  clients can still pin one request via `X-Site: V2` header)
+- `/siteuse <V1> <url>` - fix a website's URL (one arg just shows it)
+- `/siterm <V1>` - remove a website (not the last one; move its keys first)
 - `/siteswap <V1> <V2>` - exchange the two sites' URLs, reset schedules
-  and keys (active site slot stays where it is)
+  and keys
 - `/sitereset <V1> <hours>` - auto-zero that website's counters every N
   hours (`0` = off). Each provider resets billing on its own cycle —
   match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.
-- Keys belong to one website: `/add <key> [V2]` (default: active site).
-  Traffic on V1 only spends V1 keys. `/stats [V2]` filters by site.
+- Keys belong to one website: `/add <key> [V2]` (default: first site).
+  V1 traffic only spends V1 keys. `/stats [V2]` filters by site.
   A site can't be removed while keys point at it — `/rm` them first.
 - `/config` - budget, timeouts, upstream
 - `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)

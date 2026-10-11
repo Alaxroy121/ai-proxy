@@ -456,7 +456,7 @@ class SiteManager:
 
     def __init__(self, default_url: str):
         self.sites = [{"id": "V1", "url": default_url, "reset_hours": 0, "last_reset": 0.0}]
-        self.active_id = "V1"
+        self._cursor = 0
         self.store = None
         self._lock = asyncio.Lock()
         self.last_save_ok = True
@@ -492,8 +492,6 @@ class SiteManager:
             return
         async with self._lock:
             self.sites = valid
-            if any(s["id"] == doc.get("active") for s in valid):
-                self.active_id = doc["active"]
 
     async def _save(self) -> bool:
         if self.store is None:
@@ -501,7 +499,7 @@ class SiteManager:
             self.last_save_error = "no store attached"
             return False
         try:
-            await self.store.save_meta("sites", {"sites": self.sites, "active": self.active_id})
+            await self.store.save_meta("sites", {"sites": self.sites})
             self.last_save_ok = True
             self.last_save_error = ""
             return True
@@ -518,7 +516,31 @@ class SiteManager:
 
     async def list_sites(self):
         async with self._lock:
-            return [dict(s, active=(s["id"] == self.active_id)) for s in self.sites]
+            return [dict(s) for s in self.sites]
+
+    async def advance(self):
+        """Move the rotation cursor one step (one step per request)."""
+        async with self._lock:
+            if self.sites:
+                self._cursor = (self._cursor + 1) % len(self.sites)
+
+    async def ordered_ids(self):
+        """Site ids starting at the cursor — request rotation order."""
+        async with self._lock:
+            n = len(self.sites)
+            if n == 0:
+                return []
+            return [self.sites[(self._cursor + i) % n]["id"] for i in range(n)]
+
+    async def take_order(self):
+        """Snapshot rotation order AND advance, atomically (one call per request)."""
+        async with self._lock:
+            n = len(self.sites)
+            if n == 0:
+                return []
+            order = [self.sites[(self._cursor + i) % n]["id"] for i in range(n)]
+            self._cursor = (self._cursor + 1) % n
+            return order
 
     async def add_site(self, url: str) -> Optional[str]:
         url = (url or "").strip().rstrip("/")
@@ -533,17 +555,22 @@ class SiteManager:
         await self._save()
         return nid
 
-    async def use_site(self, sid: str) -> bool:
+    async def set_url(self, sid: str, url: str) -> bool:
+        """Fix/change a website's upstream URL."""
         sid = self.norm(sid)
+        url = (url or "").strip().rstrip("/")
+        if not url.startswith("http"):
+            return False
         async with self._lock:
-            if not any(s["id"] == sid for s in self.sites):
+            hit = next((s for s in self.sites if s["id"] == sid), None)
+            if hit is None:
                 return False
-            self.active_id = sid
+            hit["url"] = url
         await self._save()
         return True
 
     async def swap_sites(self, sa: str, sb: str) -> bool:
-        """Exchange URL + reset schedule between two sites (ids + active stay)."""
+        """Exchange URL + reset schedule between two sites."""
         sa, sb = self.norm(sa), self.norm(sb)
         if sa == sb:
             return False
@@ -589,31 +616,30 @@ class SiteManager:
     async def remove_site(self, sid: str) -> bool:
         sid = self.norm(sid)
         async with self._lock:
-            if sid == self.active_id or len(self.sites) <= 1:
+            if len(self.sites) <= 1:
                 return False
             before = len(self.sites)
             self.sites = [s for s in self.sites if s["id"] != sid]
             ok = len(self.sites) < before
+            self._cursor = 0
         if ok:
             await self._save()
         return ok
 
     def resolve(self, override: Optional[str] = None) -> Optional[str]:
+        """URL for an explicit site override (None when unknown/no override)."""
+        if not override:
+            return None
         return self.pick(override)[1]
 
     def pick(self, override: Optional[str] = None):
-        """(site_id, url) for an override or the active site; url None if unknown."""
+        """(site_id, url) for an explicit override; (None, None) without one."""
         if override:
             sid = self.norm(override)
             for s in self.sites:
                 if s["id"] == sid:
                     return sid, s["url"]
             return sid, None
-        for s in self.sites:
-            if s["id"] == self.active_id:
-                return s["id"], s["url"]
-        if self.sites:
-            return self.sites[0]["id"], self.sites[0]["url"]
         return None, None
 
 
@@ -722,7 +748,7 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     await pool.use_store(store)
     await sites.attach(store)
-    print(f"[sites] loaded: {[(s['id'], s['url']) for s in sites.sites]} active={sites.active_id}")
+    print(f"[sites] loaded: {[(s['id'], s['url']) for s in sites.sites]} (all serve)")
 
     async def _flusher():
         while True:
@@ -771,7 +797,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.6.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.7.0", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -837,7 +863,8 @@ async def health():
     avail = sum(1 for s in st if s["available"])
     used = sum(s["tokens_used"] for s in st)
     cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
-    return {"ok": True, "upstream": sites.resolve(), "site": sites.active_id,
+    return {"ok": True, "mode": "all-sites",
+            "sites": [s["id"] for s in sites.sites],
             "keys_total": len(st), "keys_available": avail,
             "tokens_used_total": used, "tokens_capacity_total": cap,
             "store_ok": pool.store_ok, "pending_updates": pool.pending_count()}
@@ -865,23 +892,25 @@ async def root():
 
 
 async def proxy_request(request: Request):
-    """Strict 1->2->3 rotation + preemptive token budgets. Supports SSE streaming."""
+    """All sites serve: rotate across V1, V2, … (X-Site pins one). Supports SSE streaming."""
     if pool.size == 0:
         raise HTTPException(status_code=500, detail="No API_KEYS configured on proxy")
 
     body = await request.body()
-    # Site selection: X-Site: V2 header, else the Telegram-active site.
+    # Site selection: X-Site: V2 header pins one site, else rotate across all.
     site_ov = (request.headers.get("x-site") or "").strip()
-    site_id, base_url = sites.pick(site_ov or None)
-    if base_url is None:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"unknown site '{site_ov}'. Use /sites in Telegram to list V1, V2, ..."})
+    site_id = None
+    if site_ov:
+        site_id, base_url = sites.pick(site_ov)
+        if base_url is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"unknown site '{site_ov}'. Use /sites in Telegram to list V1, V2, ..."})
     # strip /v1 prefix handling: client calls /v1/chat/completions -> upstream same path
     upstream_path = request.url.path  # e.g. /v1/chat/completions
     if request.url.query:
         upstream_path += f"?{request.url.query}"
-    upstream_url = f"{base_url}{upstream_path[len('/v1'):]}" if upstream_path.startswith("/v1") else f"{base_url}{upstream_path}"
+    suffix = upstream_path[len("/v1"):] if upstream_path.startswith("/v1") else upstream_path
 
     params_note = f"{request.method} {upstream_path}"
     last_error: Optional[str] = None
@@ -889,16 +918,29 @@ async def proxy_request(request: Request):
     tried = 0
     max_tries = min(MAX_RETRIES_PER_REQUEST, pool.size * 2)
     want_stream = _wants_stream(request, body)
+    order = await sites.take_order()
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
-            ks = await pool.next_key(site_id)
+            ks = sid = None
+            if site_id is not None:
+                sid = site_id
+                ks = await pool.next_key(sid)
+            else:
+                for cand in order:
+                    cand_ks = await pool.next_key(cand)
+                    if cand_ks is not None:
+                        ks, sid = cand_ks, cand
+                        break
             if ks is None:
                 raise HTTPException(
                     status_code=503,
-                    detail=f"No usable keys for site {site_id}. Budgets full, disabled, or none assigned.",
+                    detail=(f"No usable keys for site {site_id}. Budgets full, disabled, or none assigned."
+                            if site_id is not None else
+                            "No usable keys on any site. Budgets full, disabled, or none assigned."),
                 )
             tried += 1
+            upstream_url = f"{sites.resolve(sid)}{suffix}"
             headers = build_upstream_headers(request, ks.key)
 
             if want_stream:
@@ -927,7 +969,7 @@ async def proxy_request(request: Request):
                     await sclient.aclose()
                     last_error = f"network error with {ks.masked}: {e}"
                     await pool.mark_failed(ks)
-                    await pool.advance_past(ks, site_id)
+                    await pool.advance_past(ks, sid)
                     continue  # shift to next key
                 if sresp.status_code >= 400:
                     raw = await sresp.aread()
@@ -941,7 +983,7 @@ async def proxy_request(request: Request):
                     last_status = sresp.status_code
                     await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
-                        await pool.advance_past(ks, site_id)
+                        await pool.advance_past(ks, sid)
                         continue  # rate-limit / dead key / blip -> shift to next key
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
@@ -973,7 +1015,7 @@ async def proxy_request(request: Request):
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
                 await pool.mark_failed(ks)
-                await pool.advance_past(ks, site_id)
+                await pool.advance_past(ks, sid)
                 continue  # shift to next key
 
             ctype = resp.headers.get("content-type", "")
@@ -994,7 +1036,7 @@ async def proxy_request(request: Request):
             await pool.mark_failed(ks)
 
             if _retryable(resp.status_code, text):
-                await pool.advance_past(ks, site_id)
+                await pool.advance_past(ks, sid)
                 continue  # rate-limit / dead key / blip -> shift to next key
 
             # Real client error (400, 404, 422...) -> don't rotate further, return as-is
