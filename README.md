@@ -15,9 +15,13 @@ own keys (one key to budget, then shift within that site).
 - Token counting: real `usage.total_tokens` when upstream reports it
   (streaming requests auto-add `stream_options.include_usage` so stream
   counts are exact too), otherwise estimated as chars ÷ 4.
-  **Cached tokens count on top** (OpenAI details + Anthropic
-  cache_read/cache_creation), since platforms bill them.
-  Budgets reset on restart or `/resetusage`
+  Cached prompt tokens are **not added twice**: OpenAI-style
+  `total_tokens`/`prompt_tokens` already include them, while Anthropic
+  `cache_read_input_tokens` + `cache_creation_input_tokens` are added
+  because Anthropic bills them separately.
+- With MongoDB, budgets persist across restarts (file mode is memory-only).
+  `/resetusage` (or `/reset`) zeroes them; `/sitereset` zeroes a site on
+  schedule. Either reset restarts that site's key sequence at key 1.
 - Usage is crash-safe: memory counters are exact, deltas queue in a local
   write-ahead log + flush to the store every few seconds (and on shutdown),
   so a restart loses at most seconds of data — never hours
@@ -120,6 +124,8 @@ DM commands (also in the `/` menu + buttons under `/start`):
 - `/sitereset <V1> <hours>` - auto-zero that website's counters every N
   hours (`0` = off). Each provider resets billing on its own cycle —
   match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.
+  The auto-reset runs in the proxy itself (even if Telegram is down) and
+  starts that site again at its first key (1, 2, 3…).
 - `/sitelimit <V1> <tokens>` - default token budget on that site
   (`0` = global `MAX_TOKENS_PER_KEY`). Key-level `/limit` still wins.
 - `/sitereqlimit <V1> <n>` - default request budget on that site

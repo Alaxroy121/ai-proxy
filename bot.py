@@ -63,7 +63,7 @@ HELP_TEXT = (
     "/siteuse <V1> <url> – fix a website's URL\n"
     "/siteuse <V1> – show a website's URL\n"
     "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
-    "/sitereset <V1> <hours> – auto-zero that site every N hours (0 = off)\n"
+    "/sitereset <V1> <hours> – auto-zero that site every N hours; restarts at key 1 (0 = off)\n"
     "/sitelimit <V1> <tokens> – default token budget on that site (0 = global)\n"
     "/sitereqlimit <V1> <n> – default request budget on that site (0 = unlimited)\n"
     "/sitetimeout <V1> <sec> – request timeout on that site (0 = global)\n"
@@ -98,8 +98,8 @@ def panel_text(pool) -> str:
     total = len(pool.keys)
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
-    cap = sum(k.eff_token_limit() for k in pool.keys)
-    overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
+    cap = _cap_sum(pool.keys)
+    overall = _bar(used, cap)
     return (
         "🤖 *Proxy control panel*\n"
         "Each path serves its site: /v1→V1, /v2→V2, …\n"
@@ -236,6 +236,12 @@ def _bar(used: int, limit: int, width: int = 12) -> str:
     return f"`{'▰' * fill}{'▱' * (width - fill)}` {pct}% ({_fmt(used)}/{_fmt(limit)})"
 
 
+def _cap_sum(keys) -> int:
+    """Total token capacity, or 0 when at least one key is unlimited."""
+    caps = [ks.eff_token_limit() for ks in keys]
+    return sum(caps) if caps and all(c > 0 for c in caps) else 0
+
+
 def _stats_lines(items) -> list[str]:
     """items: [(1-based number, KeyState)]. Numbers stay global (toggle/rm use them)."""
     lines = []
@@ -301,14 +307,14 @@ def render_stats(pool, site_filter=None) -> str:
         else:
             title = f"*{sid}* `{appmod.sites.resolve(sid) or '?'}`"
         used = sum(ks.tokens_used for _, ks in items)
-        cap = sum(ks.eff_token_limit() for _, ks in items)
-        overall = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
+        cap = _cap_sum([ks for _, ks in items])
+        overall = _bar(used, cap)
         sections.append(f"{title}\n📊 overall ({sid}) {overall}\n" + "\n".join(_stats_lines(items)))
     body = "\n\n".join(sections) or "(no keys on this site)"
     if site_filter is None:
         all_used = sum(k.tokens_used for k in pool.keys)
-        all_cap = sum(k.eff_token_limit() for k in pool.keys)
-        grand = _bar(all_used, all_cap) if all_cap else f"`{_fmt(all_used)}` (no limit)"
+        all_cap = _cap_sum(pool.keys)
+        grand = _bar(all_used, all_cap)
         body = f"🌍 *overall (all sites)* {grand}\n\n" + body
     if pool.pending_count() and site_filter is None:
         body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
@@ -433,7 +439,7 @@ async def _route_button(data: str, pool, ctx, update=None):
     if data == "reset:yes":
         await pool.reset_usage()
         ctx.bot_data.pop("ms", None)
-        return "♻️ Counters zeroed.\n\n" + render_stats(pool), stats_keyboard(pool)
+        return "♻️ Counters zeroed — sequence restarts at key 1.\n\n" + render_stats(pool), stats_keyboard(pool)
     if data == "reset:no":
         return render_stats(pool), stats_keyboard(pool)
     for _act in ("limit", "reqlimit", "rm"):
@@ -509,8 +515,8 @@ def _make_health(pool):
     total = len(pool.keys)
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
-    cap = sum(k.eff_token_limit() for k in pool.keys)
-    budget = _bar(used, cap) if cap else f"`{_fmt(used)}` (no limit)"
+    cap = _cap_sum(pool.keys)
+    budget = _bar(used, cap)
     pend = pool.pending_count()
     extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     ids = ", ".join(s["id"] for s in appmod.sites.sites) or "none"
@@ -678,7 +684,9 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await _deny(update)
     await ctx.bot_data["pool"].reset_usage()
     ctx.bot_data.pop("ms", None)  # restart live milestones from zero
-    await update.message.reply_text("♻️ All token/request counters zeroed.")
+    await update.message.reply_text(
+        "♻️ All token/request counters zeroed.\n"
+        "Key sequence restarts at key 1 on every website.")
 
 
 async def cmd_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -880,24 +888,6 @@ async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def site_reset_watch(ctx: ContextTypes.DEFAULT_TYPE):
-    """Zero per-website counters when their reset schedule is due."""
-    import app as appmod
-    pool = ctx.bot_data["pool"]
-    for sid in appmod.sites.due_sites():
-        await pool.reset_usage(sid)
-        await appmod.sites.stamp_reset(sid)
-        ms = ctx.bot_data.get("ms", {})
-        for ks in pool.keys:
-            if ks.site == sid:
-                ms.pop(ks.masked, None)
-        for aid in _admin_ids():
-            try:
-                await ctx.bot.send_message(int(aid), f"🔁 `{sid}` usage auto-reset (schedule due).", parse_mode="Markdown")
-            except Exception:
-                pass
-
-
 def _pct(used: int, limit: int) -> int:
     return min(100, int(used * 100 / limit)) if limit > 0 else 0
 
@@ -918,6 +908,10 @@ async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
         prev = ms.get(ks.masked)
         if not seeded:
             ms[ks.masked] = pct  # silent baseline, no spam after restart
+            continue
+        if pct < (prev or 0):
+            # auto/manual reset: re-arm milestones from zero
+            ms[ks.masked] = pct
             continue
         hit = [m for m in MILESTONES if (prev or 0) < m <= pct]
         ms[ks.masked] = pct
@@ -1104,6 +1098,5 @@ def build_bot_app(pool) -> Application:
     if app.job_queue:
         app.job_queue.run_repeating(watch_keys, interval=30, first=10)
         app.job_queue.run_repeating(live_progress, interval=30, first=15)
-        app.job_queue.run_repeating(site_reset_watch, interval=60, first=30)
         app.job_queue.run_once(_resync_menu, when=60)
     return app

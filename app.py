@@ -119,6 +119,7 @@ class Outbox:
         self.wal = wal
         self.pending: Dict[str, Dict[str, Any]] = {}
         self.ops = 0
+        self._lock = asyncio.Lock()
 
     def add(self, key: str, tokens: int = 0, cached: int = 0, success: int = 0,
             fails: int = 0, reqs: int = 0, disabled: Optional[bool] = None,
@@ -152,28 +153,43 @@ class Outbox:
         return self.ops
 
     async def flush(self, store) -> bool:
-        if not self.pending:
-            return True
-        ok = True
-        for key, e in list(self.pending.items()):
-            try:
-                await store.update_key(key, tokens=e["tokens"], cached=e["cached"],
-                                       success=e["success"], fails=e["fails"],
-                                       reqs=e["reqs"], disabled=e["disabled"])
-                self.ops -= e["n"]
-                del self.pending[key]
-            except Exception as ex:
-                print(f"[outbox] flush {key} failed: {ex}")
-                ok = False
-        if ok:
-            self.wal.clear()
-        return ok
+        async with self._lock:
+            if not self.pending:
+                return True
+            ok = True
+            for key, e in list(self.pending.items()):
+                try:
+                    await store.update_key(key, tokens=e["tokens"], cached=e["cached"],
+                                           success=e["success"], fails=e["fails"],
+                                           reqs=e["reqs"], disabled=e["disabled"])
+                    self.ops -= e["n"]
+                    del self.pending[key]
+                except Exception as ex:
+                    print(f"[outbox] flush {key} failed: {ex}")
+                    ok = False
+            if ok:
+                self.wal.clear()
+            return ok
+
+    async def reset(self, store, site_id: Optional[str], keys: List["KeyState"]):
+        """Drop queued deltas and zero the store under the flush lock.
+
+        Prevents an in-flight flush from writing pre-reset counters back
+        after the reset (which would make usage reappear on restart).
+        """
+        async with self._lock:
+            for ks in keys:
+                self.drop(ks.key)
+            if store is not None:
+                try:
+                    await store.reset_usage(site_id)
+                except Exception as e:
+                    print(f"[store] reset failed: {e}")
 
 
 class KeyPool:
     def __init__(self, keys: List[str]):
         self.keys: List[KeyState] = [KeyState(k) for k in keys]
-        self._current = 0
         self._lock = asyncio.Lock()
         self.store = None
         from store import UsageWal
@@ -186,38 +202,40 @@ class KeyPool:
         async with self._lock:
             existing = {k.key: k for k in self.keys}
             self.keys = [existing.get(k, KeyState(k)) for k in keys]
-            self._current = 0
         await self._persist_keys()
 
     @property
     def size(self) -> int:
         return len(self.keys)
 
-    async def _scan_locked(self, site_id: Optional[str] = None) -> Optional[KeyState]:
-        n = len(self.keys)
-        if n == 0:
-            return None
-        for i in range(n):
-            ks = self.keys[(self._current + i) % n]
+    async def _scan_locked(self, site_id: Optional[str] = None,
+                           skip: Optional[set] = None) -> Optional[KeyState]:
+        """First usable key in insertion order.
+
+        Deterministic fill-then-shift: key 1 is used until it is over its
+        token/request limit, then key 2, etc. No shared cursor, so one site
+        can never move another site's sequence, and a reset always starts
+        again at the first key of the site.
+        """
+        skip = skip or set()
+        for ks in self.keys:
             if site_id is not None and ks.site != site_id:
                 continue
+            if ks.key in skip:
+                continue
             if ks.available:
-                self._current = (self._current + i) % n
                 return ks
         return None
 
-    async def next_key(self, site_id: Optional[str] = None) -> Optional[KeyState]:
+    async def next_key(self, site_id: Optional[str] = None,
+                       skip: Optional[set] = None) -> Optional[KeyState]:
         async with self._lock:
-            return await self._scan_locked(site_id)
+            return await self._scan_locked(site_id, skip)
 
     async def advance_past(self, bad: KeyState, site_id: Optional[str] = None) -> Optional[KeyState]:
+        """Skip a failed key for the current request only (next retry)."""
         async with self._lock:
-            n = len(self.keys)
-            for i, ks in enumerate(self.keys):
-                if ks is bad:
-                    self._current = (i + 1) % n
-                    break
-            return await self._scan_locked(site_id)
+            return await self._scan_locked(site_id, {bad.key})
 
     async def mark_success(self, ks: KeyState, tokens: int = 0, cached: int = 0):
         async with self._lock:
@@ -347,21 +365,15 @@ class KeyPool:
 
     async def reset_usage(self, site_id: Optional[str] = None):
         async with self._lock:
-            for ks in self.keys:
-                if site_id is not None and ks.site != site_id:
-                    continue
+            targets = [ks for ks in self.keys
+                       if site_id is None or ks.site == site_id]
+            for ks in targets:
                 ks.tokens_used = 0
                 ks.cached_tokens = 0
                 ks.req_used = 0
+                ks.success = 0
                 ks.fails = 0
-        for ks in list(self.keys):
-            if site_id is None or ks.site == site_id:
-                self.outbox.drop(ks.key)
-        if self.store is not None:
-            try:
-                await self.store.reset_usage(site_id)
-            except Exception as e:
-                print(f"[store] reset failed: {e}")
+        await self.outbox.reset(self.store, site_id, targets)
 
     async def reset_all(self):
         await self.reset_usage()
@@ -628,6 +640,24 @@ class SiteManager:
                 if (s.get("reset_hours") or 0) > 0
                 and now - (s.get("last_reset") or 0) >= s["reset_hours"] * 3600]
 
+    async def take_due(self):
+        """Atomically claim due schedules and stamp them.
+
+        Stamping inside the lock means the bot and the app background task
+        can never reset the same site twice.
+        """
+        import time
+        now = time.time()
+        async with self._lock:
+            due = [s for s in self.sites
+                   if (s.get("reset_hours") or 0) > 0
+                   and now - (s.get("last_reset") or 0) >= s["reset_hours"] * 3600]
+            for s in due:
+                s["last_reset"] = now
+        if due:
+            await self._save()
+        return [s["id"] for s in due]
+
     async def remove_site(self, sid: str) -> bool:
         sid = self.norm(sid)
         async with self._lock:
@@ -675,27 +705,57 @@ def site_timeout(site_id: str) -> int:
     return t if t > 0 else REQUEST_TIMEOUT_SEC
 
 
+def _num(v) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def extract_usage(data) -> tuple:
+    """Return (billable_tokens, cached_tokens).
+
+    Cached tokens are already part of `total_tokens` / `prompt_tokens` in
+    OpenAI-compatible APIs, so they must NOT be added again. Anthropic is
+    the exception: its `input_tokens` excludes `cache_read_input_tokens`
+    and `cache_creation_input_tokens`, which are billed on top.
+    """
     if not isinstance(data, dict):
         return 0, 0
-    u = data.get("usage") or {}
+    u = data.get("usage")
     if not isinstance(u, dict):
-        return 0, 0
-    total = u.get("total_tokens")
-    if not isinstance(total, int) or total <= 0:
-        total = (u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0)
-    if total <= 0:
-        total = (u.get("input_tokens", 0) or 0) + (u.get("output_tokens", 0) or 0)
-    det = u.get("prompt_tokens_details") or {}
-    cached = (u.get("cached_tokens", 0) or 0) + (u.get("prompt_cache_hit_tokens", 0) or 0)
-    cached += (u.get("cache_read_input_tokens", 0) or 0) + (u.get("cache_creation_input_tokens", 0) or 0)
-    if isinstance(det, dict):
-        cached += det.get("cached_tokens", 0) or 0
-    return int(total), int(cached)
+        if any(k in data for k in _USAGE_KEYS):
+            u = data
+        else:
+            return 0, 0
+
+    det = u.get("prompt_tokens_details")
+    detail_cached = _num(det.get("cached_tokens")) if isinstance(det, dict) else 0
+    openai_cached = max(_num(u.get("cached_tokens")),
+                        _num(u.get("prompt_cache_hit_tokens")),
+                        detail_cached)
+    anthropic_cached = (_num(u.get("cache_read_input_tokens"))
+                        + _num(u.get("cache_creation_input_tokens")))
+    cached = max(openai_cached, anthropic_cached)
+
+    total = _num(u.get("total_tokens"))
+    if total > 0:
+        # OpenAI-style: total already includes cached prompt tokens.
+        return total, cached
+
+    prompt, completion = u.get("prompt_tokens"), u.get("completion_tokens")
+    if prompt is not None or completion is not None:
+        return _num(prompt) + _num(completion), cached
+
+    inp, out = u.get("input_tokens"), u.get("output_tokens")
+    if inp is not None or out is not None:
+        return _num(inp) + _num(out) + anthropic_cached, anthropic_cached
+    return 0, 0
 
 
 _USAGE_KEYS = ("total_tokens", "input_tokens", "prompt_tokens",
-                "output_tokens", "completion_tokens")
+                "output_tokens", "completion_tokens",
+                "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
 def _find_usage(obj):
@@ -715,12 +775,13 @@ def _find_usage(obj):
     return None
 
 
-def _usage_from_text(text: bytes):
+def _usage_dicts_from_text(text: bytes) -> List[dict]:
+    """All usage blocks in an SSE stream, in order."""
     try:
         raw = text.decode("utf-8", errors="replace")
     except Exception:
-        return None
-    best = None
+        return []
+    out: List[dict] = []
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("data:"):
@@ -731,23 +792,44 @@ def _usage_from_text(text: bytes):
             obj = json.loads(line)
         except Exception:
             continue
-        if _find_usage(obj) is not None:
-            best = obj
-    return best
+        u = _find_usage(obj)
+        if isinstance(u, dict):
+            out.append(u)
+    return out
+
+
+def _combine_stream_usage(usages: List[dict]) -> tuple:
+    """Merge stream usage chunks (OpenAI final chunk or Anthropic events)."""
+    if not usages:
+        return 0, 0
+    openai_style = any("total_tokens" in u or "prompt_tokens" in u for u in usages)
+    if openai_style:
+        best = (0, 0)
+        for u in usages:
+            total, cached = extract_usage({"usage": u})
+            if total > best[0]:
+                best = (total, cached)
+        return best
+    # Anthropic: input/cache live in message_start, output in message_delta.
+    inp = max(_num(u.get("input_tokens")) for u in usages)
+    out = max(_num(u.get("output_tokens")) for u in usages)
+    cr = max(_num(u.get("cache_read_input_tokens")) for u in usages)
+    cc = max(_num(u.get("cache_creation_input_tokens")) for u in usages)
+    return inp + out + cr + cc, cr + cc
 
 
 def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> tuple:
     total, cached = extract_usage(data)
     if total > 0:
-        return total + cached, cached
+        return total, cached
     est = (len(req_body) + len(resp_body)) // 4 or 1
     return est, 0
 
 
 def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
-    total, cached = extract_usage(_usage_from_text(stream_bytes))
+    total, cached = _combine_stream_usage(_usage_dicts_from_text(stream_bytes))
     if total > 0:
-        return total + cached, cached
+        return total, cached
     return (len(req_body) + len(stream_bytes)) // 4 or 1, 0
 
 
@@ -780,7 +862,38 @@ async def lifespan(app: FastAPI):
             if not ok:
                 pool.last_store_error = pool.last_store_error or "flush failed"
 
+    async def _auto_resetter():
+        """Reset scheduled sites even when Telegram is down.
+
+        Ordering is deterministic (first available key), so after any reset
+        the site starts again from key 1 automatically.
+        """
+        while True:
+            await asyncio.sleep(30)
+            try:
+                due = await sites.take_due()
+            except Exception as e:
+                print(f"[sites] reset check failed: {e}")
+                continue
+            for sid in due:
+                try:
+                    await pool.reset_usage(sid)
+                except Exception as e:
+                    print(f"[sites] auto-reset {sid} failed: {e}")
+                    continue
+                print(f"[sites] auto-reset {sid}: budgets zeroed, sequence back to key 1")
+                if tg_app is not None:
+                    for aid in TELEGRAM_ADMIN_IDS:
+                        try:
+                            await tg_app.bot.send_message(
+                                int(aid),
+                                f"🔁 `{sid}` usage auto-reset — sequence starts at key 1.",
+                                parse_mode="Markdown")
+                        except Exception:
+                            pass
+
     flush_task = asyncio.create_task(_flusher())
+    reset_task = asyncio.create_task(_auto_resetter())
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_IDS:
         try:
             from bot import build_bot_app
@@ -795,6 +908,7 @@ async def lifespan(app: FastAPI):
         print("[telegram] disabled (set TELEGRAM_BOT_TOKEN + TELEGRAM_ADMIN_IDS to enable)")
     yield
     flush_task.cancel()
+    reset_task.cancel()
     try:
         await pool.outbox.flush(store)
         pool.store_ok = True
@@ -814,7 +928,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="AI Key Rotating Proxy", version="1.9.0", lifespan=lifespan)
+app = FastAPI(title="AI Key Rotating Proxy", version="1.9.1", lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -882,7 +996,8 @@ async def health():
     st = await pool.status()
     avail = sum(1 for s in st if s["available"])
     used = sum(s["tokens_used"] for s in st)
-    cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
+    caps = [s["limit"] for s in st]
+    cap = sum(caps) if caps and all(c > 0 for c in caps) else None
     return {"ok": True, "mode": "path-pinned",
             "sites": [s["id"] for s in sites.sites],
             "keys_total": len(st), "keys_available": avail,
@@ -894,7 +1009,8 @@ async def health():
 async def keys_status(_=Depends(check_proxy_auth)):
     st = await pool.status()
     used = sum(s["tokens_used"] for s in st)
-    cap = MAX_TOKENS_PER_KEY * len(st) if MAX_TOKENS_PER_KEY else None
+    caps = [s["limit"] for s in st]
+    cap = sum(caps) if caps and all(c > 0 for c in caps) else None
     return {"overall": {"tokens_used": used, "capacity": cap}, "keys": st}
 
 
@@ -957,18 +1073,20 @@ async def proxy_request(request: Request):
     tried = 0
     max_tries = min(MAX_RETRIES_PER_REQUEST, pool.size * 2)
     want_stream = _wants_stream(request, body)
+    tried_keys: set = set()
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC) as client:
         while tried < max_tries:
             # Strict per-path mapping: this request serves ONLY site_id.
             sid = site_id
-            ks = await pool.next_key(sid)
+            ks = await pool.next_key(sid, skip=tried_keys)
             if ks is None:
                 raise HTTPException(
                     status_code=503,
                     detail=f"No usable keys for site {sid}. Budgets full, disabled, or none assigned.",
                 )
             tried += 1
+            tried_keys.add(ks.key)
             upstream_url = f"{sites.resolve(sid)}{suffix}"
             headers = build_upstream_headers(request, ks.key, sid)
             timeout = site_timeout(sid)
@@ -994,7 +1112,6 @@ async def proxy_request(request: Request):
                     await sclient.aclose()
                     last_error = f"network error with {ks.masked}: {e}"
                     await pool.mark_failed(ks)
-                    await pool.advance_past(ks, sid)
                     continue
                 if sresp.status_code >= 400:
                     raw = await sresp.aread()
@@ -1008,7 +1125,6 @@ async def proxy_request(request: Request):
                     last_status = sresp.status_code
                     await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
-                        await pool.advance_past(ks, sid)
                         continue
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
@@ -1041,7 +1157,6 @@ async def proxy_request(request: Request):
             except httpx.RequestError as e:
                 last_error = f"network error with {ks.masked}: {e}"
                 await pool.mark_failed(ks)
-                await pool.advance_past(ks, sid)
                 continue
 
             if resp.status_code < 400:
@@ -1058,7 +1173,6 @@ async def proxy_request(request: Request):
             await pool.mark_failed(ks)
 
             if _retryable(resp.status_code, text):
-                await pool.advance_past(ks, sid)
                 continue
 
             return JSONResponse(status_code=resp.status_code, content={"error": text, "proxy_note": params_note})
