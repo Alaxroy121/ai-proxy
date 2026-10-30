@@ -1,153 +1,217 @@
-# AI Key-Rotating Proxy (OpenRouter / OpenAI-compatible)
+# 🤖 AI Key-Rotating Proxy (V1–V10)
 
-Strict 1→2→3 rotation + preemptive token budgets. Strict path mapping:
-`/v1/…` serves ONLY V1, `/v2/…` ONLY V2 — each site spending only its
-own keys (one key to budget, then shift within that site).
+High-performance, fault-tolerant key-rotating proxy for **OpenRouter, OpenAI, Anthropic, Grok, Gemini, DeepSeek, and local Ollama**.
 
-## How it works
-- You give it N keys: `API_KEYS=key1,key2,key3`
-- Clients call **the proxy** instead of the provider directly:
-  `POST http://YOUR-VPS:25007/v1/chat/completions`
-- `/v1/chat/completions` → V1's keys only; `/v2/…` → V2's keys only.
-  A site whose keys are all over budget answers 503 until `/reset`.
-  Pin any path to another site per request with `X-Site: V2`.
-- If a key errors (402/401/429/5xx), the same request retries with the next key
-- Token counting: real `usage.total_tokens` when upstream reports it
-  (streaming requests auto-add `stream_options.include_usage` so stream
-  counts are exact too), otherwise estimated as chars ÷ 4.
-  Cached prompt tokens are **not added twice**: OpenAI-style
-  `total_tokens`/`prompt_tokens` already include them, while Anthropic
-  `cache_read_input_tokens` + `cache_creation_input_tokens` are added
-  because Anthropic bills them separately.
-- With MongoDB, budgets persist across restarts (file mode is memory-only).
-  `/resetusage` (or `/reset`) zeroes them; `/sitereset` zeroes a site on
-  schedule. Either reset restarts that site's key sequence at key 1.
-- Usage is crash-safe: memory counters are exact, deltas queue in a local
-  write-ahead log + flush to the store every few seconds (and on shutdown),
-  so a restart loses at most seconds of data — never hours
-- Token displays are compact: `13.8m`, `500k`, `950` (API keeps raw ints)
-- Streaming holds its own upstream connection, so long generations never
-  get cut mid-response (each request still uses the current key)
+Features **strict 1→2→3 key rotation**, **preemptive token & request budgets**, **10 isolated upstream site slots (`V1` through `V10`)**, and an integrated **Telegram DM Control Bot** with 2-column grid controls.
 
-## Run on VPS (no Docker)
+---
+
+## ⚡ Key Highlights
+
+* **10 Isolated Upstream Sites (`V1` to `V10`)**:
+  * Strict path routing: `/v1/…` routes strictly to site V1, `/v2/…` to site V2, up to `/v10/…` to site V10.
+  * Uppercase `/V1/…` to `/V10/…` also fully supported.
+  * Dynamic slot management: configure URLs, friendly titles (`/sitename`), custom headers, and per-site timeout/budgets on the fly.
+* **Dual Budget Key Rotation (Tokens & Requests)**:
+  * Strict sequential rotation: **Key 1 → 2 → 3** as either token limit (`MAX_TOKENS_PER_KEY`) or request limit (`MAX_REQS_PER_KEY`) is reached.
+  * Zero-delay failover on provider errors (`401`, `402` quota exhausted, `429` rate-limited, `5xx`).
+  * Automatic `Retry-After` backoff handling for provider rate limits.
+* **Accurate Multi-Provider Token Accounting**:
+  * Extracts usage from streaming SSE (`stream_options.include_usage = true`) and non-streaming payloads across OpenAI, Anthropic, Gemini (`usageMetadata`), Ollama, and DeepSeek.
+  * Robust prompt/completion token merging across split SSE chunks.
+  * Correct cached token accounting (OpenAI cached prompt tokens are never double-billed).
+* **Telegram DM Control Bot**:
+  * Clean **2-column grid layout** optimized for mobile and desktop screens.
+  * **Single-Tap Carousel Navigation**: browse seamlessly across sites `[⬅️ V10] [🌐 Sites (V1–V10)] [V2 ➡️]`.
+  * Live push notifications at **50%**, **80%**, and **100%** usage milestones for both tokens and requests.
+  * Model inspector (`/models [V1..V10]`) directly queries upstream model availability.
+* **Storage Options**:
+  * Local file storage (`keys.txt` + write-ahead log `usage.wal`).
+  * Optional MongoDB Atlas persistence (`MONGODB_URI`) surviving server restarts and container rebuilds.
+
+---
+
+## 🛣 Path-Based Multi-Site Routing
+
+Each site slot (`V1` through `V10`) maps to its own upstream base URL, friendly title, and key pool:
+
+| Route Path | Upstream Slot | Typical Provider Example |
+| :--- | :--- | :--- |
+| `/v1/chat/completions` | **V1** | OpenRouter (`https://openrouter.ai/api/v1`) |
+| `/v2/chat/completions` | **V2** | OpenAI (`https://api.openai.com/v1`) |
+| `/v3/chat/completions` | **V3** | Anthropic (`https://api.anthropic.com/v1`) |
+| `/v4/chat/completions` | **V4** | Groq / DeepSeek / Ollama |
+| `…` | `…` | Any OpenAI-compatible endpoint |
+| `/v10/chat/completions`| **V10** | Custom / Local Upstream |
+
+> [!TIP]
+> You can also override the target site on any path by passing the header `X-Site: V2`.
+
+---
+
+## 🚀 Quickstart
+
+### 1. Clone & Configure
 
 ```bash
+git clone https://github.com/Alaxroy121/ai-proxy.git
 cd ai-proxy
-./start.sh          # first run creates .env - edit it, then run again
-# edit .env, put your keys
-./start.sh          # installs deps + starts in background
-# Or one command (from this folder, reads PORT from .env):
-python -m ai_proxy
-./start.sh status   # check health
-./start.sh logs     # tail logs
-./start.sh restart  # after editing .env
-./start.sh stop     # stop server
+
+# Copy example environment configuration
+cp .env.example .env
+nano .env
 ```
 
-## Use it (same as OpenAI)
+### 2. Environment Variables (`.env`)
+
+```ini
+# Primary Upstream (Default V1)
+UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
+API_KEYS=sk-or-v1-key1,sk-or-v1-key2,sk-or-v1-key3
+
+# Optional: Multi-Site Upstream Configurations (V1 through V10)
+V1_URL=https://openrouter.ai/api/v1
+V1_TITLE=OpenRouter
+V2_URL=https://api.openai.com/v1
+V2_TITLE=OpenAI
+V3_URL=https://api.anthropic.com/v1
+V3_TITLE=Claude
+
+# Proxy Security
+PROXY_API_KEY=your-secure-proxy-password
+PORT=8000
+
+# Budget Limits (0 = unlimited)
+MAX_TOKENS_PER_KEY=50000
+MAX_REQS_PER_KEY=1000
+
+# Optional Telegram DM Bot
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+TELEGRAM_ADMIN_IDS=123456789
+```
+
+### 3. Start the Server
+
+```bash
+./start.sh          # Installs dependencies and starts in background
+./start.sh status   # Check server health
+./start.sh logs     # View live logs
+./start.sh restart  # Restart server
+./start.sh stop     # Stop server
+```
+
+Or run directly with Python:
+```bash
+python3 -m ai_proxy
+```
+
+---
+
+## 💻 Client Usage Examples
+
+### cURL
 
 ```bash
 curl http://YOUR-VPS:8000/v1/chat/completions \
   -H "Authorization: Bearer $PROXY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-Python (openai lib):
+### Python (`openai` SDK)
+
 ```python
 from openai import OpenAI
-c = OpenAI(base_url="http://YOUR-VPS:8000/v1", api_key="PROXY_API_KEY")
-print(c.chat.completions.create(model="openai/gpt-4o-mini",
-  messages=[{"role":"user","content":"hi"}]).choices[0].message.content)
+
+client = OpenAI(
+    base_url="http://YOUR-VPS:8000/v1",  # Use /v2, /v3... for other upstream sites
+    api_key="your-proxy-api-key"
+)
+
+response = client.chat.completions.create(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "Write a python function to check primes."}]
+)
+print(response.choices[0].message.content)
 ```
 
-Python (Anthropic SDK — keys rotate via `x-api-key`, same budgets apply):
+### Python (`anthropic` SDK)
+
 ```python
 from anthropic import Anthropic
-c = Anthropic(base_url="http://YOUR-VPS:8000", api_key="PROXY_API_KEY")
-m = c.messages.create(model="your-upstream-model", max_tokens=100,
-    messages=[{"role": "user", "content": "hi"}])
-print(m.content[0].text)
+
+client = Anthropic(
+    base_url="http://YOUR-VPS:8000/v3",  # Pointing to Anthropic site slot
+    api_key="your-proxy-api-key"
+)
+
+message = client.messages.create(
+    model="claude-3-7-sonnet-20250219",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Explain quantum computing briefly."}]
+)
+print(message.content[0].text)
 ```
 
-## Ops
-- `GET /health` - public
-- `GET /keys/status` - which key is live / cooling down
-- `POST /keys/reload` - reload keys after editing env
+---
 
-## Troubleshooting
-- Buttons spin with no response / two processes answer: only ONE proxy may
-  run per bot token. Kill duplicates, then start fresh:
-  ```bash
-  ./start.sh stop; pkill -f "uvicorn app:app"; sleep 2
-  ps aux | grep uvicorn | grep -v grep   # must show nothing
-  ./start.sh start
-  ```
-- Every button tap is logged (`[bot] button ...`) — check `proxy.log`.
-- `/` menu not showing: the bot registers it itself on every boot
-  (watch `proxy.log` for `menu registered: 24 commands` + an `online`
-  DM). Shortcut: send `/menu` (or tap 📋 Menu) — it re-syncs live and
-  tells you the result. If synced but invisible, fully close + reopen
-  the Telegram chat (client caches the menu).
+## 🛠 Coding Agent Integration Guide
 
-## Storage: local file vs MongoDB
+Looking to connect your proxy with **Claude Code, Cursor, Cline, Codex, Grok Build, OpenCode, Hermes, OpenClaw, or Pi**?
 
-Unstable server disk (files like `keys.txt` / `proxy.log` vanish)? Set
-`MONGODB_URI` in `.env` (free Atlas cluster → Connect → copy string).
-Keys added via Telegram + per-key token counters then live in MongoDB
-(`ai_proxy.proxy_keys`) and survive restarts/wipes. Empty `MONGODB_URI`
-= local `keys.txt` + in-memory counters. If Mongo is unreachable at boot,
-the proxy warns and falls back to local — it never crashes over storage.
+👉 **See the complete step-by-step setup guide:** [**`apisetup.md`**](file:///home/codespace/ai-proxy/apisetup.md)
 
-## Telegram DM control (recommended)
+---
 
-No webhook / no extra port. Bot polls Telegram from inside the proxy (same process, shares memory).
+## 📱 Telegram Control Bot Commands
 
-Setup (2 min):
-1. `@BotFather` -> `/newbot` -> copy token into `.env` as `TELEGRAM_BOT_TOKEN`
-2. DM `@userinfobot` -> copy your numeric id into `TELEGRAM_ADMIN_IDS`
-3. Restart: `./start.sh restart`
-4. DM your bot `/health`
+The proxy features a built-in Telegram DM bot with auto-synced slash menus and inline buttons:
 
-DM commands (also in the `/` menu + buttons under `/start`):
-- `/start` - control panel: live status + buttons for everything below
-- `/health` - sites + usable keys + tokens used
-- `/stats` - overall total bar + per-key usage bars (masked keys only)
-- `/config` - budget, timeouts, upstream, store backend
-- `/sites` - list upstream websites (V1, V2, …)
-- `/siteadd <url>` - register a website (all sites serve at once;
-  clients can still pin one request via `X-Site: V2` header)
-- `/siteuse <V1> <url>` - fix a website's URL (one arg just shows it)
-- `/siterm <V1>` - remove a website (not the last one; move its keys first)
-- `/siteswap <V1> <V2>` - exchange the two sites' URLs, reset schedules
-  and keys
-- `/sitereset <V1> <hours>` - auto-zero that website's counters every N
-  hours (`0` = off). Each provider resets billing on its own cycle —
-  match it (e.g. `/sitereset V1 24`). Shown in `/sites` with countdown.
-  The auto-reset runs in the proxy itself (even if Telegram is down) and
-  starts that site again at its first key (1, 2, 3…).
-- `/sitelimit <V1> <tokens>` - default token budget on that site
-  (`0` = global `MAX_TOKENS_PER_KEY`). Key-level `/limit` still wins.
-- `/sitereqlimit <V1> <n>` - default request budget on that site
-  (`0` = unlimited). Key-level `/reqlimit` still wins.
-- `/sitetimeout <V1> <sec>` - request timeout for that site (`0` = global).
-- `/siteheaders <V1> <referer> <title…>` - upstream headers for that site
-  (`-` keeps the global). Shown as `[H]` in `/sites`, full in `/config`.
-- Keys belong to one website: `/add <key> [V2]` (default: first site).
-  V1 traffic only spends V1 keys. `/stats [V2]` filters by site.
-  A site can't be removed while keys point at it — `/rm` them first.
-- `/config` - budget, timeouts, upstream
-- `/add <full-key>` - add key live + saved to `keys.txt` (then delete your message)
-- `/limit <num> <tokens>` / `/reqlimit <num> <n>` / `/rm <num>` work fully
-  typed, or with no args open a guided flow: pick V1/V2 → pick key →
-  type the number (or confirm delete). `/cancel` aborts.
-- `/enable <num>` / `/disable <num>` - manual on/off
-- `/reset` - zero all token counters
-- Buttons: 📊 Stats first asks V1/V2/All, then per-site numbers with
-  ✅/⛔ toggles; one-tap `Use V2` switching in `/sites`, two-tap
-  confirm on Reset
-- Budget is `.env`-only: `MAX_TOKENS_PER_KEY` (restart proxy to change)
+| Command | Description |
+| :--- | :--- |
+| `/start` | Open main interactive control dashboard |
+| `/health` | Check keys ready, upstream status, storage health |
+| `/stats [V1..V10]` | View per-key tokens and request metrics by site |
+| `/models [V1..V10]` | Fetch live accepted models from upstream provider |
+| `/config` | View global budgets, timeouts, retries, and sites |
+| `/sites` | List sites V1–V10 with routing URLs and schedules |
+| `/siteadd <url>` | Add a new upstream site to next free slot |
+| `/sitename <V1..V10> <title>` | Set friendly site label (e.g. `OpenRouter`, `Groq`) |
+| `/siteuse <V1..V10> [url]` | Update or inspect upstream URL for slot |
+| `/siteswap <V1> <V2>` | Swap URLs, reset schedules, and keys between sites |
+| `/sitereset <V1..V10> <hours>` | Schedule auto-reset counter every N hours (0 = off) |
+| `/sitelimit <V1..V10> <tokens>`| Set default token budget on specific site |
+| `/sitereqlimit <V1..V10> <n>` | Set default request budget on specific site |
+| `/sitetimeout <V1..V10> <sec>` | Set HTTP timeout for specific site |
+| `/siteheaders <V1..V10> <ref> <title>` | Set custom upstream headers (`-` keeps global) |
+| `/siterm <V1..V10>` | Remove a site slot (must have 0 keys) |
+| `/add <key> [V1..V10]` | Add a key to a site (auto-creates slot if needed) |
+| `/limit <num> <tokens>` | Set individual key token budget (0 = global) |
+| `/reqlimit <num> <n>` | Set individual key request budget (0 = unlimited) |
+| `/rm <num\|mask>` | Remove a key from pool |
+| `/enable <num>` | Re-enable a disabled key |
+| `/disable <num>` | Take key offline manually |
+| `/reset` | Zero all token and request counters across all sites |
+| `/cancel` | Cancel any pending guided budget/removal flow |
+| `/menu` | Re-sync Telegram command menu |
+| `/help` | Detailed command help guide |
 
-Auto-alerts: budget/over-budget + **live progress pushes at 50/80/100%
-per key** (no need to spam `/stats`). Optional auto-digest:
-`LIVE_DIGEST_MIN=10` pushes `/stats` every 10 min while usage changes.
+---
+
+## 🛡 Storage & Persistence
+
+* **Local Mode (Default)**:
+  * Key list stored in `keys.txt`.
+  * Usage metrics journaled to write-ahead log (`usage.wal`).
+* **MongoDB Atlas (Recommended for cloud/VPS)**:
+  * Set `MONGODB_URI` in `.env`.
+  * Keys, site configurations, token metrics, and request counts persist across disk reboots, container redeployments, and host migrations.
+
+---
+
+## 📄 License
+
+MIT License. Open-source and free to deploy anywhere.
