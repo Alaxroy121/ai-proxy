@@ -499,21 +499,59 @@ tg_app = None
 
 
 class SiteManager:
+    MAX_SITES = 10
+
     def __init__(self, default_url: str):
-        self.sites = [self._blank("V1", default_url)]
         self._cursor = 0
         self.store = None
         self._lock = asyncio.Lock()
         self.last_save_ok = True
         self.last_save_error = ""
 
+        # Auto-detect V1 through V10 from environment variables
+        # e.g. V1_URL, V2_URL.. V10_URL or UPSTREAM_BASE_URL_V1..V10
+        initial_sites = []
+        for n in range(1, self.MAX_SITES + 1):
+            sid = f"V{n}"
+            env_url = (
+                os.getenv(f"{sid}_URL", "")
+                or os.getenv(f"UPSTREAM_{sid}_URL", "")
+                or os.getenv(f"UPSTREAM_BASE_URL_{sid}", "")
+            ).strip()
+            if not env_url and n == 1:
+                env_url = default_url.strip()
+            if env_url and env_url.startswith("http"):
+                site_entry = self._blank(sid, env_url.rstrip("/"))
+                title = os.getenv(f"{sid}_TITLE", os.getenv(f"{sid}_NAME", "")).strip()
+                if title:
+                    site_entry["title"] = title
+                tb = int(os.getenv(f"{sid}_TOKEN_BUDGET", "0"))
+                if tb > 0:
+                    site_entry["token_budget"] = tb
+                rb = int(os.getenv(f"{sid}_REQ_BUDGET", "0"))
+                if rb > 0:
+                    site_entry["req_budget"] = rb
+                initial_sites.append(site_entry)
+
+        if not initial_sites:
+            initial_sites.append(self._blank("V1", default_url))
+        self.sites = self._sort_sites(initial_sites)
+
+    @staticmethod
+    def _sort_sites(site_list: list) -> list:
+        def _site_num(s):
+            sid = s.get("id", "V1")
+            digits = "".join(filter(str.isdigit, sid))
+            return int(digits) if digits else 999
+        return sorted(site_list, key=_site_num)
+
     @staticmethod
     def _blank(sid: str, url: str) -> dict:
         return {"id": sid, "url": url, "reset_hours": 0, "last_reset": 0.0,
                 "token_budget": 0, "req_budget": 0, "timeout": 0, "referer": "", "title": ""}
 
-    @staticmethod
-    def norm(sid: str) -> str:
+    @classmethod
+    def norm(cls, sid: str) -> str:
         s = (sid or "").strip().upper()
         if s.isdigit():
             s = "V" + s
@@ -535,7 +573,7 @@ class SiteManager:
             url = s.get("url", "")
             if not url.startswith("http"):
                 continue
-            valid.append({"id": s["id"], "url": url.rstrip("/"),
+            valid.append({"id": self.norm(s["id"]), "url": url.rstrip("/"),
                           "reset_hours": float(s.get("reset_hours") or 0),
                           "last_reset": float(s.get("last_reset") or 0),
                           "token_budget": int(s.get("token_budget") or 0),
@@ -546,7 +584,10 @@ class SiteManager:
         if not valid:
             return
         async with self._lock:
-            self.sites = valid
+            by_id = {s["id"]: s for s in self.sites}
+            for v in valid:
+                by_id[v["id"]] = v
+            self.sites = self._sort_sites(list(by_id.values()))
 
     async def _save(self) -> bool:
         if self.store is None:
@@ -594,29 +635,61 @@ class SiteManager:
             self._cursor = (self._cursor + 1) % n
             return order
 
-    async def add_site(self, url: str) -> Optional[str]:
+    async def add_site(self, url: str, sid: Optional[str] = None) -> Optional[str]:
         url = (url or "").strip().rstrip("/")
         if not url.startswith("http"):
             return None
         async with self._lock:
-            n = 1
-            while any(s["id"] == f"V{n}" for s in self.sites):
-                n += 1
-            nid = f"V{n}"
-            self.sites.append(self._blank(nid, url))
+            if sid:
+                nid = self.norm(sid)
+            else:
+                nid = None
+                for n in range(1, self.MAX_SITES + 1):
+                    cand = f"V{n}"
+                    if not any(s["id"] == cand for s in self.sites):
+                        nid = cand
+                        break
+                if nid is None:
+                    return None  # All 10 slots filled
+            hit = next((s for s in self.sites if s["id"] == nid), None)
+            if hit:
+                hit["url"] = url
+            else:
+                self.sites.append(self._blank(nid, url))
+            self.sites = self._sort_sites(self.sites)
         await self._save()
         return nid
 
     async def set_url(self, sid: str, url: str) -> bool:
         sid = self.norm(sid)
+        digits = "".join(filter(str.isdigit, sid))
+        if not digits or not (1 <= int(digits) <= self.MAX_SITES):
+            return False
         url = (url or "").strip().rstrip("/")
         if not url.startswith("http"):
             return False
         async with self._lock:
             hit = next((s for s in self.sites if s["id"] == sid), None)
+            if hit is not None:
+                hit["url"] = url
+            else:
+                self.sites.append(self._blank(sid, url))
+            self.sites = self._sort_sites(self.sites)
+        await self._save()
+        return True
+
+    async def set_title(self, sid: str, title: str) -> bool:
+        sid = self.norm(sid)
+        digits = "".join(filter(str.isdigit, sid))
+        if not digits or not (1 <= int(digits) <= self.MAX_SITES):
+            return False
+        async with self._lock:
+            hit = next((s for s in self.sites if s["id"] == sid), None)
             if hit is None:
-                return False
-            hit["url"] = url
+                hit = self._blank(sid, UPSTREAM_BASE_URL)
+                self.sites.append(hit)
+                self.sites = self._sort_sites(self.sites)
+            hit["title"] = title.strip()
         await self._save()
         return True
 
@@ -662,10 +735,15 @@ class SiteManager:
     async def configure_site(self, sid: str, token_budget=None, req_budget=None, timeout=None,
                              referer=None, title=None) -> bool:
         sid = self.norm(sid)
+        digits = "".join(filter(str.isdigit, sid))
+        if not digits or not (1 <= int(digits) <= self.MAX_SITES):
+            return False
         async with self._lock:
             hit = next((s for s in self.sites if s["id"] == sid), None)
             if hit is None:
-                return False
+                hit = self._blank(sid, UPSTREAM_BASE_URL)
+                self.sites.append(hit)
+                self.sites = self._sort_sites(self.sites)
             if token_budget is not None:
                 hit["token_budget"] = max(0, int(token_budget))
             if req_budget is not None:
@@ -687,11 +765,6 @@ class SiteManager:
                 and now - (s.get("last_reset") or 0) >= s["reset_hours"] * 3600]
 
     async def take_due(self):
-        """Atomically claim due schedules and stamp them.
-
-        Stamping inside the lock means the bot and the app background task
-        can never reset the same site twice.
-        """
         import time
         now = time.time()
         async with self._lock:
@@ -1472,20 +1545,24 @@ async def proxy_request(request: Request):
                                  "proxy_note": params_note})
 
 
-for _path in [
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/embeddings",
-    "/v1/images/generations",
-    "/v1/audio/transcriptions",
-    "/v1/audio/speech",
-]:
-    app.add_api_route(_path, proxy_request, methods=["POST"], dependencies=[Depends(check_proxy_auth)])
+# Dedicated routes for all 10 sites (V1 through V10)
+for n in range(1, SiteManager.MAX_SITES + 1):
+    for ep in [
+        "/chat/completions",
+        "/completions",
+        "/embeddings",
+        "/images/generations",
+        "/audio/transcriptions",
+        "/audio/speech",
+    ]:
+        app.add_api_route(f"/v{n}{ep}", proxy_request, methods=["POST"], dependencies=[Depends(check_proxy_auth)])
+        app.add_api_route(f"/V{n}{ep}", proxy_request, methods=["POST"], dependencies=[Depends(check_proxy_auth)])
+    app.add_api_route(f"/v{n}/models", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
+    app.add_api_route(f"/V{n}/models", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
+    app.add_api_route(f"/v{n}", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
+    app.add_api_route(f"/V{n}", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
 
-app.add_api_route("/v1/models", proxy_request, methods=["GET"], dependencies=[Depends(check_proxy_auth)])
-app.add_api_route("/v1/{full_path:path}", proxy_request, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-                  dependencies=[Depends(check_proxy_auth)])
-# Site-pinned paths: /v2/chat/completions -> site V2 (/v1/* stays all-sites).
+# Generic catch-all path mapping for all sites V1..V10
 app.add_api_route("/v{site}/{full_path:path}", proxy_request, methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
                   dependencies=[Depends(check_proxy_auth)])
 app.add_api_route("/v{site}", proxy_request, methods=["GET"],

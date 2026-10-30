@@ -31,10 +31,12 @@ COMMAND_MENU = [
     ("health", "Upstream + overall usage"),
     ("stats", "Keys by website: /stats [V1]"),
     ("config", "Budget, store, timeouts"),
-    ("sites", "List upstream websites V1, V2…"),
+    ("sites", "List upstream websites V1–V10"),
     ("siteadd", "Add website: /siteadd <url>"),
+    ("sitename", "Set site title: /sitename <V1> <name>"),
     ("siteuse", "Fix website URL: /siteuse <V1> <url>"),
     ("siteswap", "Swap two sites: /siteswap <V1> <V2>"),
+    ("models", "List upstream models: /models [V1]"),
     ("sitereset", "Auto-reset schedule: /sitereset <V1> <hours>"),
     ("sitelimit", "Site token budget: /sitelimit <V1> <n>"),
     ("sitereqlimit", "Site request budget: /sitereqlimit <V1> <n>"),
@@ -47,47 +49,53 @@ COMMAND_MENU = [
     ("rm", "Remove a key: /rm <num>"),
     ("enable", "Re-enable a key: /enable <num>"),
     ("disable", "Take a key offline: /disable <num>"),
-    ("reset", "Zero all token counters"),
+    ("reset", "Zero all token/request counters"),
     ("cancel", "Cancel a pending input"),
     ("menu", "Re-sync the / command menu now"),
-    ("help", "All commands"),
+    ("help", "All commands guide"),
 ]
 
 HELP_TEXT = (
-    "Commands:\n"
-    "/health – totals + upstream\n"
-    "/stats [V1] – keys grouped by website\n"
-    "/config – budget, store & timeouts\n"
-    "/sites – list websites (V1, V2…); tip: /v2/… paths pin site V2\n"
-    "/siteadd <url> – add website\n"
-    "/siteuse <V1> <url> – fix a website's URL\n"
-    "/siteuse <V1> – show a website's URL\n"
+    "🤖 *AI Key-Rotating Proxy Commands (V1–V10)*\n\n"
+    "📊 *Monitoring:*\n"
+    "/health – totals, store health & sites status\n"
+    "/stats [V1..V10] – keys and metrics grouped by website\n"
+    "/models [V1..V10] – fetch accepted models from upstream\n"
+    "/config – global budget, store, retries & timeouts\n\n"
+    "🌐 *Sites Management (V1 through V10):*\n"
+    "/sites – list all configured websites with routing paths\n"
+    "/siteadd <url> – add website to next available slot\n"
+    "/sitename <V1..V10> <title> – set friendly name (e.g. OpenRouter)\n"
+    "/siteuse <V1..V10> <url> – set or inspect site upstream URL\n"
     "/siteswap <V1> <V2> – exchange URLs, schedules and keys\n"
-    "/sitereset <V1> <hours> – auto-zero that site every N hours; restarts at key 1 (0 = off)\n"
-    "/sitelimit <V1> <tokens> – default token budget on that site (0 = global)\n"
-    "/sitereqlimit <V1> <n> – default request budget on that site (0 = unlimited)\n"
-    "/sitetimeout <V1> <sec> – request timeout on that site (0 = global)\n"
-    "/siteheaders <V1> <referer> <title…> – headers on that site (`-` = global)\n"
-    "/siterm <V1> – remove website\n"
-    "/add <full-key> [V1] – add key to a website (default: first site)\n"
+    "/sitereset <V1..V10> <hours> – auto-reset usage every N hours (0 = off)\n"
+    "/sitelimit <V1..V10> <tokens> – default token budget on that site\n"
+    "/sitereqlimit <V1..V10> <n> – default request budget on that site\n"
+    "/sitetimeout <V1..V10> <sec> – request timeout on that site\n"
+    "/siteheaders <V1..V10> <ref> <title> – custom headers (`-` keeps global)\n"
+    "/siterm <V1..V10> – remove website slot\n\n"
+    "🔑 *Keys Management:*\n"
+    "/add <key> [V1..V10] – add key to a website (default: first site)\n"
     "/limit <num> <tokens> – token budget for one key (0 = global)\n"
     "/reqlimit <num> <n> – request budget for one key (0 = unlimited)\n"
     "/rm <num|mask> – remove key\n"
     "/enable <num> – re-enable key\n"
     "/disable <num> – take key offline\n"
-    "/reset – zero all token counters\n"
-    "/limit, /reqlimit, /rm with no args – guided: pick site, pick key\n"
-    "/menu – force re-sync of this / menu\n"
-    "📈 Live: auto-push at 50/80/100% per key."
+    "/reset – zero all token and request counters\n"
+    "/cancel – cancel guided input\n"
+    "/menu – force re-sync of this / menu\n\n"
+    "💡 *Path Routing:* `/v1/…`→V1 … `/v10/…`→V10. Each path routes strictly to that site.\n"
+    "📈 *Live Push:* Automatic alerts at 50%, 80%, and 100% per key (tokens & requests)."
 )
 
 MAIN_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("📊 Stats", callback_data="stats"),
      InlineKeyboardButton("❤️ Health", callback_data="health")],
-    [InlineKeyboardButton("⚙️ Config", callback_data="config"),
-     InlineKeyboardButton("🌐 Sites", callback_data="sites")],
-    [InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+    [InlineKeyboardButton("🌐 Sites (V1–V10)", callback_data="sites"),
+     InlineKeyboardButton("⚙️ Config", callback_data="config")],
+    [InlineKeyboardButton("♻️ Reset Counters", callback_data="reset:ask"),
      InlineKeyboardButton("📋 Menu", callback_data="menu")],
+    [InlineKeyboardButton("ℹ️ Help Guide", callback_data="help")],
 ])
 
 HOME_BUTTON = InlineKeyboardButton("🏠 Panel", callback_data="panel")
@@ -111,23 +119,26 @@ def panel_text(pool) -> str:
     req_used = sum(k.req_used for k in pool.keys)
     req_cap = _req_cap_sum(pool.keys)
     has_req = any(k.eff_req_limit() > 0 for k in pool.keys)
-    req_line = f"🧾 Requests {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}\n" if has_req else ""
+    req_line = f"🧾 Requests {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}\n" if (has_req or req_used > 0) else ""
     site_lines = []
     for s in appmod.sites.sites:
         keys = [k for k in pool.keys if k.site == s["id"]]
-        site_lines.append(
-            f"{_site_badge(keys)} `{s['id']}` {sum(1 for k in keys if k.available)}/{len(keys)}")
+        usable = sum(1 for k in keys if k.available)
+        badge = _site_badge(keys)
+        title_suffix = f" · {s['title'][:12]}" if s.get("title") else ""
+        site_lines.append(f"{badge} `{s['id']}` *{usable}/{len(keys)}*{title_suffix}")
     store = "ok" if getattr(pool, "store_ok", True) else "lag"
     pend = pool.pending_count()
     tail = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     return (
-        "🤖 *Proxy Control*\n"
-        f"🔑 *{avail}/{total}* keys · 💾 {store}\n"
+        "🤖 *Proxy Control (V1–V10)*\n"
+        f"🔑 *{avail}/{total}* keys ready · 💾 store {store}\n\n"
+        f"🌐 *Sites Status:*\n"
         f"{chr(10).join(site_lines) or '`no sites`'}\n\n"
         f"📊 Tokens {overall_tokens}\n"
         f"{req_line}"
-        "🎯 Key 1 → 2 → 3 as limits fill\n"
-        "📈 Live alerts at 50 / 80 / 100%" + tail
+        "🎯 Rotation: Key 1 → 2 → 3 as limits fill\n"
+        "📈 Live alerts at 50% · 80% · 100%" + tail
     )
 
 
@@ -171,12 +182,19 @@ def stats_keyboard(pool, site_id=None) -> InlineKeyboardMarkup:
 async def stats_picker_keyboard(pool) -> InlineKeyboardMarkup:
     import app as appmod
     rows = []
+    curr_row = []
     for s in await appmod.sites.list_sites():
         keys = [k for k in pool.keys if k.site == s["id"]]
         usable = sum(1 for k in keys if k.available)
-        rows.append([InlineKeyboardButton(
-            f"{_site_badge(keys)} {s['id']} · {usable}/{len(keys)} keys",
-            callback_data=f"statssite:{s['id']}")])
+        title_str = f" {s['title'][:6]}" if s.get("title") else ""
+        curr_row.append(InlineKeyboardButton(
+            f"{_site_badge(keys)} {s['id']}{title_str} ({usable}/{len(keys)})",
+            callback_data=f"statssite:{s['id']}"))
+        if len(curr_row) == 2:
+            rows.append(curr_row)
+            curr_row = []
+    if curr_row:
+        rows.append(curr_row)
     rows.append([InlineKeyboardButton("🌍 All sites", callback_data="statssite:ALL")])
     rows.append([InlineKeyboardButton("🌐 Sites", callback_data="sites"), HOME_BUTTON])
     return InlineKeyboardMarkup(rows)
@@ -194,13 +212,19 @@ def health_keyboard() -> InlineKeyboardMarkup:
 def sites_keyboard(pool=None) -> InlineKeyboardMarkup:
     import app as appmod
     rows = []
+    curr_row = []
     for s in appmod.sites.sites:
         keys = [k for k in pool.keys if k.site == s["id"]] if pool is not None else []
         usable = sum(1 for k in keys if k.available)
-        rows.append([InlineKeyboardButton(
-            f"{_site_badge(keys)} {s['id']} · {usable}/{len(keys)} keys",
-            callback_data=f"site:{s['id']}")])
-    rows.append([InlineKeyboardButton("📊 Stats", callback_data="stats"),
+        title_str = f" {s['title'][:6]}" if s.get("title") else ""
+        btn_text = f"{_site_badge(keys)} {s['id']}{title_str} ({usable}/{len(keys)})"
+        curr_row.append(InlineKeyboardButton(btn_text, callback_data=f"site:{s['id']}"))
+        if len(curr_row) == 2:
+            rows.append(curr_row)
+            curr_row = []
+    if curr_row:
+        rows.append(curr_row)
+    rows.append([InlineKeyboardButton("📊 All Stats", callback_data="statssite:ALL"),
                  InlineKeyboardButton("❤️ Health", callback_data="health")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
                  HOME_BUTTON])
@@ -208,22 +232,62 @@ def sites_keyboard(pool=None) -> InlineKeyboardMarkup:
 
 
 def site_detail_keyboard(sid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Keys", callback_data=f"statssite:{sid}"),
-         InlineKeyboardButton("🧠 Models", callback_data=f"models:{sid}")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"site:{sid}"),
-         InlineKeyboardButton("🌐 Websites", callback_data="sites")],
-        [HOME_BUTTON],
+    import app as appmod
+    known = [s["id"] for s in appmod.sites.sites]
+    sid = appmod.SiteManager.norm(sid)
+    prev_sid = next_sid = sid
+    if sid in known and len(known) > 1:
+        idx = known.index(sid)
+        prev_sid = known[(idx - 1) % len(known)]
+        next_sid = known[(idx + 1) % len(known)]
+
+    rows = []
+    if len(known) > 1:
+        rows.append([
+            InlineKeyboardButton(f"⬅️ {prev_sid}", callback_data=f"site:{prev_sid}"),
+            InlineKeyboardButton("🌐 Sites (V1–V10)", callback_data="sites"),
+            InlineKeyboardButton(f"{next_sid} ➡️", callback_data=f"site:{next_sid}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton("🌐 Sites (V1–V10)", callback_data="sites")])
+
+    rows.append([
+        InlineKeyboardButton(f"📊 Keys ({sid})", callback_data=f"statssite:{sid}"),
+        InlineKeyboardButton("🧠 Models", callback_data=f"models:{sid}"),
     ])
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"site:{sid}"),
+        HOME_BUTTON,
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def models_keyboard(sid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh models", callback_data=f"models:{sid}:r"),
-         InlineKeyboardButton("🌐 Site", callback_data=f"site:{sid}")],
-        [InlineKeyboardButton("🌐 Websites", callback_data="sites"),
-         HOME_BUTTON],
+    import app as appmod
+    known = [s["id"] for s in appmod.sites.sites]
+    sid = appmod.SiteManager.norm(sid)
+    prev_sid = next_sid = sid
+    if sid in known and len(known) > 1:
+        idx = known.index(sid)
+        prev_sid = known[(idx - 1) % len(known)]
+        next_sid = known[(idx + 1) % len(known)]
+
+    rows = []
+    if len(known) > 1:
+        rows.append([
+            InlineKeyboardButton(f"⬅️ {prev_sid}", callback_data=f"models:{prev_sid}"),
+            InlineKeyboardButton(f"🌐 Site {sid}", callback_data=f"site:{sid}"),
+            InlineKeyboardButton(f"{next_sid} ➡️", callback_data=f"models:{next_sid}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(f"🌐 Site {sid}", callback_data=f"site:{sid}")])
+
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh models", callback_data=f"models:{sid}:r"),
+        InlineKeyboardButton("🌐 All Sites", callback_data="sites"),
     ])
+    rows.append([HOME_BUTTON])
+    return InlineKeyboardMarkup(rows)
 
 
 RESET_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
@@ -240,6 +304,7 @@ async def render_sites(pool=None) -> str:
         keys = [k for k in pool.keys if k.site == s["id"]] if pool is not None else []
         usable = sum(1 for k in keys if k.available)
         keys_note = f"{usable}/{len(keys)}"
+        title_bit = f" *{s['title']}*" if s.get("title") else ""
         rh = s.get("reset_hours") or 0
         if rh > 0:
             left = max(0, rh * 3600 - (time.time() - (s.get("last_reset") or 0)))
@@ -257,9 +322,9 @@ async def render_sites(pool=None) -> str:
             bits += f" · t/o {s['timeout']}s"
         if s.get("referer") or s.get("title"):
             bits += " · H"
-        lines.append(f"{_site_badge(keys)} `{s['id']}` {keys_note} · `{s['url']}`{sched}{bits}")
-    return ("🌐 *Websites — tap one for details*\n" + "\n".join(lines or ["(none)"]) +
-            "\n\n`/v1/…`→V1 · `/v2/…`→V2 · each path uses only that site.")
+        lines.append(f"{_site_badge(keys)} `{s['id']}`{title_bit} ({keys_note}) · `{s['url']}`{sched}{bits}")
+    return ("🌐 *Websites (V1–V10) — tap one for details*\n\n" + "\n".join(lines or ["(none)"]) +
+            "\n\n💡 *Path routing:* `/v1/…`→V1 … `/v10/…`→V10 (isolated per site).")
 
 
 async def render_site_detail(pool, sid: str) -> str:
@@ -277,21 +342,25 @@ async def render_site_detail(pool, sid: str) -> str:
     if nxt is not None:
         num = next((i for i, k in enumerate(pool.keys, 1) if k is nxt), "?")
         nxt_txt = f"`{nxt.masked}` (#{num})"
+    title_hdr = f" — *{site['title']}*" if site.get("title") else ""
     lines = [
-        f"🌐 *{sid}*",
-        f"`{site['url']}`",
+        f"🌐 *Site {sid}*{title_hdr}",
+        f"🔗 Upstream: `{site['url']}`",
+        f"🛣 Endpoint: `/v{sid[1:].lower()}/chat/completions` (or `/V{sid[1:]}/…`)",
         "",
         f"🔑 *{usable}/{len(keys)}* keys usable",
-        f"▶️ Next key: {nxt_txt}",
+        f"▶️ Next key in rotation: {nxt_txt}",
         f"📊 Tokens: {_bar(used, _cap_sum(keys))}",
     ]
     req_used = sum(k.req_used for k in keys)
     req_caps = [k.eff_req_limit() for k in keys]
     if any(c > 0 for c in req_caps):
         if all(c > 0 for c in req_caps):
-            lines.append(f"🧾 Requests: `{req_used}/{sum(req_caps)}`")
+            lines.append(f"🧾 Requests: {_bar(req_used, sum(req_caps))}")
         else:
-            lines.append(f"🧾 Requests: `{req_used}` (mixed limits)")
+            lines.append(f"🧾 Requests: `{req_used:,}` (mixed limits)")
+    elif req_used > 0:
+        lines.append(f"🧾 Requests: `{req_used:,}` (no limit)")
     rh = site.get("reset_hours") or 0
     if rh > 0:
         left = max(0, rh * 3600 - (time.time() - (site.get("last_reset") or 0)))
@@ -486,10 +555,12 @@ def render_stats(pool, site_filter=None) -> str:
             groups.append(("?", orphans))
     sections = []
     for sid, items in groups:
+        site_obj = appmod.sites.get_site(sid) if sid != "?" else None
+        title_str = f" — *{site_obj['title']}*" if site_obj and site_obj.get("title") else ""
         if sid == "?":
             title = "❓ *unknown site*"
         else:
-            title = f"*{sid}* `{appmod.sites.resolve(sid) or '?'}`"
+            title = f"*{sid}*{title_str} `{appmod.sites.resolve(sid) or '?'}`"
         used = sum(ks.tokens_used for _, ks in items)
         cap = _cap_sum([ks for _, ks in items])
         overall = _bar(used, cap)
@@ -508,7 +579,7 @@ def render_stats(pool, site_filter=None) -> str:
         body = f"🌍 *overall tokens* {grand}{req_grand}\n\n" + body
     if pool.pending_count() and site_filter is None:
         body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
-    return f"🔑 *keys by website*\n\n{body}"
+    return f"🔑 *keys by website (V1–V10)*\n\n{body}"
 
 
 def render_config(pool=None) -> str:
@@ -517,6 +588,8 @@ def render_config(pool=None) -> str:
     sitelines = []
     for s in appmod.sites.sites:
         bits = ""
+        if s.get("title"):
+            bits += f" title={s['title']}"
         if (s.get("token_budget") or 0) > 0:
             bits += f" lim={_fmt(s['token_budget'])}"
         if (s.get("req_budget") or 0) > 0:
@@ -529,8 +602,8 @@ def render_config(pool=None) -> str:
         sitelines.append(f"  `{s['id']}` `{s['url']}` ({n} keys){bits}")
     sitelines = "\n".join(sitelines) or "  (none)"
     return (
-        "⚙️ *config*\n"
-        f"mode: one path per site — /v1→V1, /v2→V2 (X-Site overrides)\n"
+        "⚙️ *Configuration (V1–V10)*\n"
+        f"mode: isolated paths per site — /v1→V1 … /v10→V10 (X-Site overrides)\n"
         f"websites:\n{sitelines}\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
         f"request budget/key: `{getattr(appmod, 'MAX_REQS_PER_KEY', 0)}` (0 = unlimited)\n"
@@ -727,24 +800,26 @@ def _make_health(pool):
     has_req = any(k.eff_req_limit() > 0 for k in pool.keys)
 
     lines = [
-        "❤️ *Health*",
+        "❤️ *Proxy Health (V1–V10)*",
         f"🔑 Keys: *{avail}/{total}* usable · 💾 {store}",
         f"📊 Tokens total: {_bar(used, _cap_sum(pool.keys))}",
     ]
-    if has_req:
+    if has_req or req_used > 0:
         lines.append(f"🧾 Requests total: {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}")
+    lines.append("")
 
     for s in appmod.sites.sites:
         keys = [k for k in pool.keys if k.site == s["id"]]
         su = sum(1 for k in keys if k.available)
         s_rcap = _req_cap_sum(keys)
         req_bit = f" · req {_bar(sum(k.req_used for k in keys), s_rcap)}" if s_rcap else ""
+        title_bit = f" ({s['title']})" if s.get("title") else ""
         lines.append(
-            f"{_site_badge(keys)} `{s['id']}` {su}/{len(keys)} · "
+            f"{_site_badge(keys)} `{s['id']}`{title_bit} *{su}/{len(keys)}* · "
             f"{_bar(sum(k.tokens_used for k in keys), _cap_sum(keys))}{req_bit}")
     if pend:
-        lines.append(f"⚠️ `{pend}` updates unsynced")
-    lines.append("`/v1/…`→V1 · `/v2/…`→V2 · each path isolated")
+        lines.append(f"\n⚠️ `{pend}` updates unsynced")
+    lines.append("\n🛣 `/v1/…`→V1 … `/v10/…`→V10 · isolated routing")
     return "\n".join(lines)
 
 
@@ -760,9 +835,9 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import app as appmod
     site = appmod.SiteManager.norm(ctx.args[0]) if ctx.args else None
     if site and site not in [s["id"] for s in appmod.sites.sites]:
-        return await update.message.reply_text("❓ Unknown site. See /sites.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10). See /sites.")
     await update.message.reply_text(render_stats(ctx.bot_data["pool"], site), parse_mode="Markdown",
-                                        reply_markup=stats_keyboard(ctx.bot_data["pool"]))
+                                    reply_markup=stats_keyboard(ctx.bot_data["pool"], site))
 
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -775,12 +850,16 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if not ctx.args:
-        return await update.message.reply_text("Usage: /add <full-api-key> [V1] (site defaults to first)")
+        return await update.message.reply_text("Usage: /add <full-api-key> [V1..V10] (site defaults to first)")
     import app as appmod
     default_site = appmod.sites.sites[0]["id"] if appmod.sites.sites else "V1"
     site = appmod.SiteManager.norm(ctx.args[1]) if len(ctx.args) > 1 else default_site
-    if site not in [s["id"] for s in appmod.sites.sites]:
-        return await update.message.reply_text("❓ Unknown site. See /sites.")
+    digits = "".join(filter(str.isdigit, site))
+    if digits and 1 <= int(digits) <= appmod.SiteManager.MAX_SITES:
+        if site not in [s["id"] for s in appmod.sites.sites]:
+            await appmod.sites.add_site(appmod.UPSTREAM_BASE_URL, sid=site)
+    else:
+        return await update.message.reply_text("❓ Unknown site. Must be V1 through V10. See /sites.")
     pool = ctx.bot_data["pool"]
     ok = await pool.add_key(ctx.args[0], site)
     if ok:
@@ -803,11 +882,17 @@ async def cmd_rm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def action_site_keyboard(pool, action: str) -> InlineKeyboardMarkup:
     """Site picker starting a guided flow (limit / reqlimit / rm)."""
     import app as appmod
-    rows = []
+    rows, row = [], []
     for s in await appmod.sites.list_sites():
         n = sum(1 for k in pool.keys if k.site == s["id"])
-        rows.append([InlineKeyboardButton(f"🌐 {s['id']} ({n} keys)",
-                                          callback_data=f"{action}site:{s['id']}")])
+        label_title = f" {s['title'][:6]}" if s.get("title") else ""
+        row.append(InlineKeyboardButton(f"🌐 {s['id']}{label_title} ({n})",
+                                        callback_data=f"{action}site:{s['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([HOME_BUTTON])
     return InlineKeyboardMarkup(rows)
 
@@ -981,21 +1066,52 @@ async def cmd_siteuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) == 2:
         ok = await appmod.sites.set_url(ctx.args[0], ctx.args[1])
         if not ok:
-            return await update.message.reply_text("❓ Unknown site or bad URL (must start with http).", parse_mode="Markdown")
+            return await update.message.reply_text("❓ Invalid site (must be V1–V10) or bad URL (must start with http).", parse_mode="Markdown")
         await update.message.reply_text(
             f"🔗 `{appmod.SiteManager.norm(ctx.args[0])}` URL updated." + appmod.sites.save_status_note(),
             parse_mode="Markdown")
         return
     if len(ctx.args) != 1:
-        return await update.message.reply_text("Usage: /siteuse <V1> <new-url> — or one arg to show it")
+        return await update.message.reply_text("Usage: /siteuse <V1..V10> <new-url> — or one arg to show it")
     sid = appmod.SiteManager.norm(ctx.args[0])
     hit = next((s for s in appmod.sites.sites if s["id"] == sid), None)
     if hit is None:
-        return await update.message.reply_text("❓ Unknown site. See /sites.", parse_mode="Markdown")
+        return await update.message.reply_text("❓ Unknown site (V1–V10). See /sites.", parse_mode="Markdown")
     nkeys = sum(1 for k in ctx.bot_data["pool"].keys if k.site == sid)
     await update.message.reply_text(
         f"`{sid}` → `{hit['url']}` ({nkeys} keys)\nFix it: `/siteuse {sid} <new-url>`",
         parse_mode="Markdown")
+
+
+async def cmd_sitename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    if len(ctx.args) < 2:
+        return await update.message.reply_text("Usage: /sitename <V1..V10> <Title>  e.g. /sitename V1 OpenRouter")
+    import app as appmod
+    sid = appmod.SiteManager.norm(ctx.args[0])
+    digits = "".join(filter(str.isdigit, sid))
+    if not digits or not (1 <= int(digits) <= appmod.SiteManager.MAX_SITES):
+        return await update.message.reply_text("❓ Invalid site. Must be V1 through V10.")
+    title = " ".join(ctx.args[1:]).strip()
+    ok = await appmod.sites.set_title(sid, title)
+    if not ok:
+        return await update.message.reply_text("❓ Failed to set site title.")
+    await update.message.reply_text(
+        f"🏷 Title for `{sid}` set to *{title}*." + appmod.sites.save_status_note(),
+        parse_mode="Markdown")
+
+
+async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return await _deny(update)
+    import app as appmod
+    default_site = appmod.sites.sites[0]["id"] if appmod.sites.sites else "V1"
+    sid = appmod.SiteManager.norm(ctx.args[0]) if ctx.args else default_site
+    if appmod.sites.get_site(sid) is None:
+        return await update.message.reply_text("❓ Unknown site (V1–V10). See /sites.")
+    text = await fetch_site_models(ctx.bot_data["pool"], sid, ctx.bot_data, force=True)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=models_keyboard(sid))
 
 
 async def cmd_siteswap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1026,7 +1142,7 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 1:
-        return await update.message.reply_text("Usage: /siterm <V1> (can't remove the last one)")
+        return await update.message.reply_text("Usage: /siterm <V1..V10> (can't remove the last one)")
     import app as appmod
     sid = appmod.SiteManager.norm(ctx.args[0])
     if any(ks.site == sid for ks in ctx.bot_data["pool"].keys):
@@ -1039,11 +1155,11 @@ async def cmd_sitelimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /sitelimit <V1> <tokens>  e.g. /sitelimit V1 50000 (0 = global default)")
+        return await update.message.reply_text("Usage: /sitelimit <V1..V10> <tokens>  e.g. /sitelimit V1 50000 (0 = global default)")
     import app as appmod
     ok = await appmod.sites.configure_site(ctx.args[0], token_budget=int(ctx.args[1]))
     if not ok:
-        return await update.message.reply_text("❓ Unknown site.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
         f"⚙️ Default token budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
@@ -1053,11 +1169,11 @@ async def cmd_sitereqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /sitereqlimit <V1> <n>  e.g. /sitereqlimit V1 5000 (0 = unlimited)")
+        return await update.message.reply_text("Usage: /sitereqlimit <V1..V10> <n>  e.g. /sitereqlimit V1 5000 (0 = unlimited)")
     import app as appmod
     ok = await appmod.sites.configure_site(ctx.args[0], req_budget=int(ctx.args[1]))
     if not ok:
-        return await update.message.reply_text("❓ Unknown site.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
         f"⚙️ Default request budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
@@ -1067,11 +1183,11 @@ async def cmd_sitetimeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /sitetimeout <V1> <seconds>  e.g. /sitetimeout V1 90 (0 = global default)")
+        return await update.message.reply_text("Usage: /sitetimeout <V1..V10> <seconds>  e.g. /sitetimeout V1 90 (0 = global default)")
     import app as appmod
     ok = await appmod.sites.configure_site(ctx.args[0], timeout=int(ctx.args[1]))
     if not ok:
-        return await update.message.reply_text("❓ Unknown site.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
         f"⚙️ Timeout on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1])}s`" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
@@ -1081,11 +1197,11 @@ async def cmd_siteheaders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) < 3:
-        return await update.message.reply_text("Usage: /siteheaders <V1> <referer> <title…>  (`-` keeps global)")
+        return await update.message.reply_text("Usage: /siteheaders <V1..V10> <referer> <title…>  (`-` keeps global)")
     import app as appmod
     ok = await appmod.sites.configure_site(ctx.args[0], referer=ctx.args[1], title=" ".join(ctx.args[2:]))
     if not ok:
-        return await update.message.reply_text("❓ Unknown site.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
         f"⚙️ Headers on `{appmod.SiteManager.norm(ctx.args[0])}` updated." + appmod.sites.save_status_note(),
         parse_mode="Markdown")
@@ -1095,7 +1211,7 @@ async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     if len(ctx.args) != 2:
-        return await update.message.reply_text("Usage: /sitereset <V1> <hours>  e.g. /sitereset V1 24 (0 = off)")
+        return await update.message.reply_text("Usage: /sitereset <V1..V10> <hours>  e.g. /sitereset V1 24 (0 = off)")
     try:
         hours = float(ctx.args[1])
     except ValueError:
@@ -1103,7 +1219,7 @@ async def cmd_sitereset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import app as appmod
     ok = await appmod.sites.set_reset(ctx.args[0], hours)
     if not ok:
-        return await update.message.reply_text("❓ Unknown site.")
+        return await update.message.reply_text("❓ Unknown site (V1–V10).")
     msg = f"🔁 `{ctx.args[0].upper()}` auto-resets every `{hours:g}h`." if hours > 0 else \
         f"🔁 Auto-reset off for `{ctx.args[0].upper()}`."
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -1340,8 +1456,10 @@ def build_bot_app(pool) -> Application:
     app.add_handler(CommandHandler("reqlimit", cmd_reqlimit))
     app.add_handler(CommandHandler("sites", cmd_sites))
     app.add_handler(CommandHandler("siteadd", cmd_siteadd))
+    app.add_handler(CommandHandler("sitename", cmd_sitename))
     app.add_handler(CommandHandler("siteuse", cmd_siteuse))
     app.add_handler(CommandHandler("siteswap", cmd_siteswap))
+    app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("sitereset", cmd_sitereset))
     app.add_handler(CommandHandler("sitelimit", cmd_sitelimit))
     app.add_handler(CommandHandler("sitereqlimit", cmd_sitereqlimit))
