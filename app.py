@@ -69,6 +69,15 @@ def save_keys_list(keys: List[str]):
     Path(KEYS_FILE).write_text("\n".join(keys) + ("\n" if keys else ""))
 
 
+def _fmt_num(n: int) -> str:
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "m"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}".rstrip("0").rstrip(".") + "k"
+    return f"{n:,}"
+
+
 @dataclass
 class KeyState:
     key: str
@@ -90,12 +99,16 @@ class KeyState:
         self.masked = f"{k[:7]}...{k[-4:]}" if len(k) > 12 else "***"
 
     def eff_token_limit(self) -> int:
+        if self.token_limit < 0:
+            return 0  # explicitly set to unlimited
         if self.token_limit > 0:
             return self.token_limit
         sb = site_token_budget(self.site)
         return sb if sb > 0 else MAX_TOKENS_PER_KEY
 
     def eff_req_limit(self) -> int:
+        if self.req_limit < 0:
+            return 0  # explicitly set to unlimited
         if self.req_limit > 0:
             return self.req_limit
         sb = site_req_budget(self.site)
@@ -133,11 +146,13 @@ class KeyState:
         t_over = tlim > 0 and self.tokens_used >= tlim
         r_over = rlim > 0 and self.req_used >= rlim
         if t_over and r_over:
-            return "token & request limits hit"
+            return f"token ({_fmt_num(self.tokens_used)}/{_fmt_num(tlim)}) & request ({self.req_used}/{rlim}) limits reached"
         if t_over:
-            return "token limit hit"
+            req_part = f", reqs {self.req_used}/{rlim}" if rlim > 0 else f", reqs {self.req_used}"
+            return f"token limit reached ({_fmt_num(self.tokens_used)}/{_fmt_num(tlim)}{req_part})"
         if r_over:
-            return "request limit hit"
+            tok_part = f", tokens {_fmt_num(self.tokens_used)}/{_fmt_num(tlim)}" if tlim > 0 else f", tokens {_fmt_num(self.tokens_used)}"
+            return f"request limit reached ({self.req_used}/{rlim}{tok_part})"
         return "in rotation"
 
 
@@ -209,6 +224,7 @@ class Outbox:
         async with self._lock:
             for ks in keys:
                 self.drop(ks.key)
+            self.wal.clear()
             if store is not None:
                 try:
                     await store.reset_usage(site_id)
@@ -266,13 +282,15 @@ class KeyPool:
         async with self._lock:
             return await self._scan_locked(site_id, {bad.key})
 
-    async def mark_success(self, ks: KeyState, tokens: int = 0, cached: int = 0):
+    async def mark_success(self, ks: KeyState, tokens: int = 0, cached: int = 0, is_inference: bool = True):
         async with self._lock:
             ks.success += 1
-            ks.req_used += 1
+            if is_inference:
+                ks.req_used += 1
             ks.tokens_used += max(0, tokens)
             ks.cached_tokens += max(0, cached)
-        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached), success=1, reqs=1)
+        self.outbox.add(ks.key, tokens=max(0, tokens), cached=max(0, cached),
+                        success=1, reqs=1 if is_inference else 0)
 
     async def add_usage(self, ks: KeyState, tokens: int, cached: int = 0):
         async with self._lock:
@@ -1263,6 +1281,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Key Rotating Proxy", version="1.9.1", lifespan=lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -1433,9 +1461,21 @@ async def proxy_request(request: Request):
             headers = build_upstream_headers(request, ks.key, sid)
             timeout = site_timeout(sid)
 
+            clean_path = upstream_path.split("?")[0].rstrip("/")
+            is_inference = any(
+                clean_path.endswith(ep)
+                for ep in (
+                    "/chat/completions",
+                    "/completions",
+                    "/embeddings",
+                    "/images/generations",
+                    "/audio/transcriptions",
+                    "/messages",
+                )
+            )
+
             if want_stream:
                 body_out = body
-                clean_path = upstream_path.split("?")[0].rstrip("/")
                 if clean_path.endswith("/chat/completions") or clean_path.endswith("/completions"):
                     try:
                         payload = json.loads(body) if body else {}
@@ -1481,7 +1521,7 @@ async def proxy_request(request: Request):
                         continue
                     return JSONResponse(status_code=sresp.status_code,
                                         content={"error": text, "proxy_note": params_note})
-                await pool.mark_success(ks)
+                await pool.mark_success(ks, is_inference=is_inference)
 
                 async def gen(_r=sresp, _c=sclient, _k=ks, _b=body_out):
                     buf = bytearray()
@@ -1517,7 +1557,7 @@ async def proxy_request(request: Request):
 
             if resp.status_code < 400:
                 data = resp.json() if resp.content else {}
-                await pool.mark_success(ks, *count_tokens(body, resp.content, data))
+                await pool.mark_success(ks, *count_tokens(body, resp.content, data), is_inference=is_inference)
                 return JSONResponse(status_code=resp.status_code, content=data)
 
             try:

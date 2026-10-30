@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 proxy.log
 .proxy.pid
+*.wal

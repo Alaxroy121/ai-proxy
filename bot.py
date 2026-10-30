@@ -59,8 +59,8 @@ HELP_TEXT = (
     "🤖 *AI Key-Rotating Proxy Commands (V1–V10)*\n\n"
     "📊 *Monitoring:*\n"
     "/health – totals, store health & sites status\n"
-    "/stats [V1..V10] – keys and metrics grouped by website\n"
-    "/models [V1..V10] – fetch accepted models from upstream\n"
+    "/stats `[V1..V10]` – keys and metrics grouped by website\n"
+    "/models `[V1..V10]` – fetch accepted models from upstream\n"
     "/config – global budget, store, retries & timeouts\n\n"
     "🌐 *Sites Management (V1 through V10):*\n"
     "/sites – list all configured websites with routing paths\n"
@@ -75,9 +75,9 @@ HELP_TEXT = (
     "/siteheaders <V1..V10> <ref> <title> – custom headers (`-` keeps global)\n"
     "/siterm <V1..V10> – remove website slot\n\n"
     "🔑 *Keys Management:*\n"
-    "/add <key> [V1..V10] – add key to a website (default: first site)\n"
-    "/limit <num> <tokens> – token budget for one key (0 = global)\n"
-    "/reqlimit <num> <n> – request budget for one key (0 = unlimited)\n"
+    "/add <key> `[V1..V10]` – add key to a website (default: first site)\n"
+    "/limit <num> <tokens> – token budget for one key (`0` or `off` = unlimited)\n"
+    "/reqlimit <num> <n> – request budget for one key (`0` or `off` = unlimited)\n"
     "/rm <num|mask> – remove key\n"
     "/enable <num> – re-enable key\n"
     "/disable <num> – take key offline\n"
@@ -125,7 +125,7 @@ def panel_text(pool) -> str:
         keys = [k for k in pool.keys if k.site == s["id"]]
         usable = sum(1 for k in keys if k.available)
         badge = _site_badge(keys)
-        title_suffix = f" · {s['title'][:12]}" if s.get("title") else ""
+        title_suffix = f" · `{s['title'][:12]}`" if s.get("title") else ""
         site_lines.append(f"{badge} `{s['id']}` *{usable}/{len(keys)}*{title_suffix}")
     store = "ok" if getattr(pool, "store_ok", True) else "lag"
     pend = pool.pending_count()
@@ -304,7 +304,7 @@ async def render_sites(pool=None) -> str:
         keys = [k for k in pool.keys if k.site == s["id"]] if pool is not None else []
         usable = sum(1 for k in keys if k.available)
         keys_note = f"{usable}/{len(keys)}"
-        title_bit = f" *{s['title']}*" if s.get("title") else ""
+        title_bit = f" `{s['title']}`" if s.get("title") else ""
         rh = s.get("reset_hours") or 0
         if rh > 0:
             left = max(0, rh * 3600 - (time.time() - (s.get("last_reset") or 0)))
@@ -342,7 +342,7 @@ async def render_site_detail(pool, sid: str) -> str:
     if nxt is not None:
         num = next((i for i, k in enumerate(pool.keys, 1) if k is nxt), "?")
         nxt_txt = f"`{nxt.masked}` (#{num})"
-    title_hdr = f" — *{site['title']}*" if site.get("title") else ""
+    title_hdr = f" — `{site['title']}`" if site.get("title") else ""
     lines = [
         f"🌐 *Site {sid}*{title_hdr}",
         f"🔗 Upstream: `{site['url']}`",
@@ -514,7 +514,7 @@ def _stats_lines(items) -> list[str]:
             bits += f" ({_fmt(ks.cached_tokens)} cached)"
         if ks.token_limit:
             bits += f" [lim {_fmt(ks.token_limit)}]"
-        lines.append(f"{i}. {state} `{ks.masked}` {bits} ({extra})")
+        lines.append(f"{i}. {state} `{ks.masked}` {bits} (`{extra}`)")
     return lines or ["(no keys)"]
 
 
@@ -556,7 +556,7 @@ def render_stats(pool, site_filter=None) -> str:
     sections = []
     for sid, items in groups:
         site_obj = appmod.sites.get_site(sid) if sid != "?" else None
-        title_str = f" — *{site_obj['title']}*" if site_obj and site_obj.get("title") else ""
+        title_str = f" — `{site_obj['title']}`" if site_obj and site_obj.get("title") else ""
         if sid == "?":
             title = "❓ *unknown site*"
         else:
@@ -589,7 +589,7 @@ def render_config(pool=None) -> str:
     for s in appmod.sites.sites:
         bits = ""
         if s.get("title"):
-            bits += f" title={s['title']}"
+            bits += f" title=`{s['title']}`"
         if (s.get("token_budget") or 0) > 0:
             bits += f" lim={_fmt(s['token_budget'])}"
         if (s.get("req_budget") or 0) > 0:
@@ -616,14 +616,51 @@ def render_config(pool=None) -> str:
     )
 
 
+async def _safe_edit_message(q, text: str, reply_markup=None):
+    from telegram.error import BadRequest
+    import re
+    try:
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except BadRequest as e:
+        err = str(e)
+        if "Message is not modified" in err:
+            try:
+                await q.answer("Refreshed")
+            except Exception:
+                pass
+            return
+        if "can't parse entities" in err.lower() or "entity" in err.lower():
+            print(f"[bot] markdown parse error ({err}); falling back to plain text")
+            try:
+                clean = re.sub(r"[*`]", "", text)
+                await q.edit_message_text(clean, parse_mode=None, reply_markup=reply_markup)
+                return
+            except BadRequest as e2:
+                if "Message is not modified" in str(e2):
+                    try:
+                        await q.answer("Refreshed")
+                    except Exception:
+                        pass
+                    return
+                print(f"[bot] plain text fallback failed: {e2}")
+        else:
+            print(f"[bot] edit failed: {e}")
+    except Exception as e:
+        print(f"[bot] unexpected edit error: {e}")
+
+
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Button router: panel, views, key toggles, site switching, reset confirm."""
     q = update.callback_query
-    if not q or not _is_admin(update):
-        if q:
-            await q.answer("⛔ Not authorized.", show_alert=True)
+    if not q:
         return
-    await q.answer()
+    if not _is_admin(update):
+        await q.answer("⛔ Not authorized.", show_alert=True)
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
     pool = ctx.bot_data["pool"]
     data = q.data or ""
     if data == "noop":
@@ -634,11 +671,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await _route_button(data, pool, ctx, update)
     except Exception as e:
         print(f"[bot] button '{data}' failed: {e}")
-        text, kb = f"❌ Button failed: `{e}`\nTry again or use the typed command.", MAIN_KEYBOARD
-    try:
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    except Exception as e:
-        print(f"[bot] edit failed: {e}")
+        import traceback
+        traceback.print_exc()
+        text, kb = f"❌ Button error: `{e}`\nTry again or use the typed command.", MAIN_KEYBOARD
+    await _safe_edit_message(q, text, kb)
 
 
 async def _route_button(data: str, pool, ctx, update=None):
@@ -748,7 +784,7 @@ async def _route_button(data: str, pool, ctx, update=None):
                 "action": _act, "key": ks.key, "site": site, "ts": time.time()}
             noun = "token budget" if _act == "limit" else "request budget"
             return (f"✏️ Reply with the {noun} number for `{ks.masked}` "
-                    f"(`0` = {'global default' if _act == 'limit' else 'unlimited'}), or /cancel.",
+                    f"(`0` or `off` = unlimited), or /cancel.",
                     CANCEL_KEYBOARD)
     if data.startswith("rmkey:"):
         parts = data.split(":")
@@ -813,7 +849,7 @@ def _make_health(pool):
         su = sum(1 for k in keys if k.available)
         s_rcap = _req_cap_sum(keys)
         req_bit = f" · req {_bar(sum(k.req_used for k in keys), s_rcap)}" if s_rcap else ""
-        title_bit = f" ({s['title']})" if s.get("title") else ""
+        title_bit = f" (`{s['title']}`)" if s.get("title") else ""
         lines.append(
             f"{_site_badge(keys)} `{s['id']}`{title_bit} *{su}/{len(keys)}* · "
             f"{_bar(sum(k.tokens_used for k in keys), _cap_sum(keys))}{req_bit}")
@@ -948,22 +984,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.bot_data["pending"].pop(uid, None)
         await update.message.reply_text("⌛ Expired — start again with /limit or /reqlimit.")
         return
-    txt = update.message.text.strip().replace(",", "").replace(" ", "")
-    if not txt.isdigit():
-        await update.message.reply_text("❓ Send a plain number, or /cancel.")
+    raw = update.message.text.strip().replace(",", "").replace(" ", "").lower()
+    if raw in ("0", "off", "unlim", "unlimited", "none", "-1"):
+        val = -1
+    elif raw.isdigit():
+        val = int(raw)
+    else:
+        await update.message.reply_text("❓ Send a number, `0`/`off` for unlimited, or /cancel.", parse_mode="Markdown")
         return
     pool = ctx.bot_data["pool"]
     if pend["action"] == "limit":
-        masked = await pool.set_token_limit(pend["key"], int(txt))
+        masked = await pool.set_token_limit(pend["key"], val)
         what = "Token budget"
+        desc = "`unlimited` (token limit disabled)" if val < 0 else f"`{val:,}` tokens"
     else:
-        masked = await pool.set_req_limit(pend["key"], int(txt))
+        masked = await pool.set_req_limit(pend["key"], val)
         what = "Request budget"
+        desc = "`unlimited` (request limit disabled)" if val < 0 else f"`{val:,}` requests"
     ctx.bot_data["pending"].pop(uid, None)
     if not masked:
         await update.message.reply_text("❓ That key is gone. Start again.")
         return
-    await update.message.reply_text(f"⚙️ {what} for `{masked}`: `{int(txt):,}`", parse_mode="Markdown")
+    await update.message.reply_text(f"⚙️ {what} for `{masked}`: {desc}", parse_mode="Markdown")
 
 
 async def cmd_enable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -997,9 +1039,20 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) == 2 and ctx.args[1].isdigit():
-        masked = await ctx.bot_data["pool"].set_token_limit(ctx.args[0], int(ctx.args[1]))
-        await update.message.reply_text(f"⚙️ Token budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+    if len(ctx.args) == 2:
+        val_str = ctx.args[1].lower().strip()
+        if val_str in ("0", "off", "unlim", "unlimited", "none", "-1"):
+            limit_val = -1
+            desc = "`unlimited` (token limit disabled)"
+        elif val_str.isdigit():
+            limit_val = int(val_str)
+            desc = f"`{limit_val:,}` tokens"
+        else:
+            return await update.message.reply_text("Usage: /limit <num> <tokens|0|off>")
+        masked = await ctx.bot_data["pool"].set_token_limit(ctx.args[0], limit_val)
+        if not masked:
+            return await update.message.reply_text("❓ Key not found.")
+        await update.message.reply_text(f"⚙️ Token budget for `{masked}`: {desc}", parse_mode="Markdown")
         return
     if len(ctx.args) == 1:
         return await _begin_guided(update, ctx, "limit", ctx.args[0])
@@ -1011,9 +1064,30 @@ async def cmd_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_reqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) == 2 and ctx.args[1].isdigit():
-        masked = await ctx.bot_data["pool"].set_req_limit(ctx.args[0], int(ctx.args[1]))
-        await update.message.reply_text(f"⚙️ Request budget for `{masked}`: `{int(ctx.args[1]):,}`" if masked else "❓ Not found.", parse_mode="Markdown")
+    if len(ctx.args) == 2:
+        val_str = ctx.args[1].lower().strip()
+        if val_str in ("0", "off", "unlim", "unlimited", "none", "-1"):
+            limit_val = -1
+            desc = "`unlimited` (request limit disabled)"
+        elif val_str.isdigit():
+            limit_val = int(val_str)
+            desc = f"`{limit_val:,}` requests"
+        else:
+            return await update.message.reply_text("Usage: /reqlimit <num> <n|0|off>")
+        pool = ctx.bot_data["pool"]
+        masked = await pool.set_req_limit(ctx.args[0], limit_val)
+        if not masked:
+            return await update.message.reply_text("❓ Key not found.")
+        i = pool._find_index(ctx.args[0])
+        ks = pool.keys[i] if i is not None else None
+        extra_note = ""
+        if ks and limit_val > 0 and ks.eff_token_limit() > 0:
+            extra_note = (
+                f"\n\nℹ️ *Note:* Key also has a token limit of `{_fmt(ks.eff_token_limit())}`. "
+                f"Key shifts when *either* limit is reached.\n"
+                f"💡 To rotate *purely* after {limit_val} requests, run `/limit {ctx.args[0]} 0` to disable the token cap."
+            )
+        await update.message.reply_text(f"⚙️ Request budget for `{masked}`: {desc}{extra_note}", parse_mode="Markdown")
         return
     if len(ctx.args) == 1:
         return await _begin_guided(update, ctx, "reqlimit", ctx.args[0])
@@ -1036,8 +1110,7 @@ async def _begin_guided(update, ctx, action: str, ident: str):
         "action": action, "key": ks.key, "site": ks.site, "ts": time.time()}
     noun = "token budget" if action == "limit" else "request budget"
     await update.message.reply_text(
-        f"✏️ Reply with the {noun} number for `{ks.masked}` (`0` = "
-        f"{'global default' if action == 'limit' else 'unlimited'}), or /cancel.",
+        f"✏️ Reply with the {noun} number for `{ks.masked}` (`0` or `off` = unlimited), or /cancel.",
         parse_mode="Markdown", reply_markup=CANCEL_KEYBOARD)
 
 
@@ -1327,7 +1400,7 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
                 try:
                     await ctx.bot.send_message(
                         int(aid),
-                        f"⚠️ Key out of rotation: `{masked}`\nReason: *{why}*\n🎯 Shifted to next available key.",
+                        f"⚠️ Key out of rotation: `{masked}`\nReason: `{why}`\n🎯 Shifted to next available key.",
                         parse_mode="Markdown")
                 except Exception:
                     pass
