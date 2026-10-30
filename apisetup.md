@@ -177,25 +177,117 @@ curl http://YOUR-VPS-IP:8000/v4/chat/completions \
 
 ## 6. OpenCode
 
-[OpenCode](https://github.com/opencode-ai) is an open-source terminal coding interpreter and autonomous workspace assistant.
+[OpenCode](https://opencode.ai) is an open-source terminal AI coding assistant. It uses the Vercel AI SDK (`@ai-sdk/openai`, `@ai-sdk/anthropic`) under the hood and resolves configuration from environment variables or `~/.config/opencode/opencode.json`.
 
-### Configuration File (`~/.opencode/config.json`)
-Create or edit `~/.opencode/config.json`:
+---
+
+### Method 1: Environment Variables (Recommended & Quickest)
+
+The simplest and most reliable way to route OpenCode through your proxy is setting standard OpenAI environment variables in your shell (or adding them to `~/.bashrc` / `~/.zshrc`):
+
+```bash
+# Point to your proxy slot (V1 to V10)
+export OPENAI_BASE_URL="http://YOUR-VPS-IP:8000/v1"
+export OPENAI_API_KEY="your-proxy-api-key"
+
+# Optional: Default model
+export OPENCODE_MODEL="openai/gpt-4o"
+
+# Run OpenCode
+opencode
+```
+
+> [!NOTE]
+> Do **not** use `OPENCODE_BASE_URL` or `OPENCODE_API_KEY`. OpenCode does not recognize those variables and will bypass your proxy. Use `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+
+If routing Anthropic Claude models through your proxy slot:
+```bash
+export ANTHROPIC_BASE_URL="http://YOUR-VPS-IP:8000/v1"
+export ANTHROPIC_API_KEY="your-proxy-api-key"
+opencode
+```
+
+---
+
+### Method 2: Global Configuration File (`~/.config/opencode/opencode.json`)
+
+OpenCode does **not** read `~/.opencode/config.json`. Its configuration file is located at:
+* **Linux / macOS**: `~/.config/opencode/opencode.json` (or `opencode.jsonc`)
+* **Project Directory**: `./opencode.json` in your project root
+* **Windows**: `%USERPROFILE%\.config\opencode\opencode.json`
+
+Create or edit `~/.config/opencode/opencode.json`:
+
 ```json
 {
-  "provider": "openai",
-  "baseURL": "http://YOUR-VPS-IP:8000/v1",
-  "apiKey": "your-proxy-api-key",
-  "defaultModel": "openai/gpt-4o",
-  "temperature": 0.2
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-4o",
+  "provider": {
+    "openai": {
+      "settings": {
+        "baseURL": "http://YOUR-VPS-IP:8000/v1"
+      }
+    }
+  }
 }
 ```
 
-### Environment Variable Override
+*(Note: Depending on your OpenCode version, the key may also be defined under `"options": { "baseURL": "..." }`)*.
+
+---
+
+### Method 3: Custom OpenAI-Compatible Provider (`opencode.json`)
+
+To configure the proxy as a dedicated custom provider in OpenCode:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ai-proxy/gpt-4o",
+  "provider": {
+    "ai-proxy": {
+      "name": "AI Rotating Proxy",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://YOUR-VPS-IP:8000/v1"
+      },
+      "models": {
+        "gpt-4o": {
+          "name": "GPT-4o (Rotated)"
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### Method 4: CLI Authentication (`opencode auth login`)
+
+To save credentials without placing keys in plain text config files:
+1. Run:
+   ```bash
+   opencode auth login openai
+   ```
+2. Enter your `PROXY_API_KEY`.
+3. In your environment (e.g. `~/.bashrc`), set:
+   ```bash
+   export OPENAI_BASE_URL="http://YOUR-VPS-IP:8000/v1"
+   ```
+
+---
+
+### 💡 Using Open Interpreter (`interpreter`)?
+If your setup uses **Open Interpreter** (CLI: `interpreter`), connect using:
 ```bash
-export OPENCODE_BASE_URL="http://YOUR-VPS-IP:8000/v1"
-export OPENCODE_API_KEY="your-proxy-api-key"
-opencode
+interpreter --api_base "http://YOUR-VPS-IP:8000/v1" --api_key "your-proxy-api-key" --model "openai/gpt-4o"
+```
+Or in `~/.config/open-interpreter/config.yaml`:
+```yaml
+api_base: "http://YOUR-VPS-IP:8000/v1"
+api_key: "your-proxy-api-key"
+model: "openai/gpt-4o"
 ```
 
 ---
