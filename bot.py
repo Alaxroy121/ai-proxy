@@ -1385,35 +1385,61 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
     import time
     pool = ctx.bot_data["pool"]
     prev: dict = ctx.bot_data.setdefault("prev_over", {})
-    cur = {k.masked: (not k.available) for k in pool.keys}
+    cur = {k.key: (not k.available) for k in pool.keys}
     if not prev:
         ctx.bot_data["prev_over"] = cur
         return
-    for masked, out in cur.items():
-        was = prev.get(masked, False)
+    for k_key, out in cur.items():
+        was = prev.get(k_key, False)
         if out and not was:
-            ks = next((k for k in pool.keys if k.masked == masked), None)
-            why = ks.status_reason() if ks and hasattr(ks, "status_reason") else (
-                "disabled" if ks and ks.disabled else "budget hit"
+            ks = next((k for k in pool.keys if k.key == k_key), None)
+            if not ks:
+                continue
+            num = next((i for i, k in enumerate(pool.keys, 1) if k.key == k_key), "?")
+            why = ks.status_reason() if hasattr(ks, "status_reason") else (
+                "disabled" if ks.disabled else "budget hit"
             )
+            # Check next available key specifically on this site
+            next_ks = await pool.next_key(ks.site)
+            if next_ks is not None:
+                next_num = next((i for i, k in enumerate(pool.keys, 1) if k.key == next_ks.key), "?")
+                shift_line = f"🎯 Shifted to next key on `{ks.site}`: `#{next_num}` `{next_ks.masked}`."
+            else:
+                shift_line = f"🚨 No more usable keys on `{ks.site}`! Use `/add <key> {ks.site}` or `/resetusage`."
             for aid in _admin_ids():
                 try:
                     await ctx.bot.send_message(
                         int(aid),
-                        f"⚠️ Key out of rotation: `{masked}`\nReason: `{why}`\n🎯 Shifted to next available key.",
+                        f"⚠️ Key out of rotation: `#{num}` `{ks.masked}` (`{ks.site}`)\nReason: `{why}`\n{shift_line}",
                         parse_mode="Markdown")
                 except Exception:
-                    pass
+                    try:
+                        clean_msg = f"⚠️ Key out of rotation: #{num} {ks.masked} ({ks.site})\nReason: {why}\n{shift_line.replace('`', '')}"
+                        await ctx.bot.send_message(int(aid), clean_msg, parse_mode=None)
+                    except Exception:
+                        pass
         elif was and not out:
-            for aid in _admin_ids():
-                try:
-                    await ctx.bot.send_message(int(aid), f"✅ Key back in rotation: `{masked}`", parse_mode="Markdown")
-                except Exception:
-                    pass
+            ks = next((k for k in pool.keys if k.key == k_key), None)
+            if ks:
+                num = next((i for i, k in enumerate(pool.keys, 1) if k.key == k_key), "?")
+                for aid in _admin_ids():
+                    try:
+                        await ctx.bot.send_message(
+                            int(aid),
+                            f"✅ Key back in rotation: `#{num}` `{ks.masked}` (`{ks.site}`)",
+                            parse_mode="Markdown")
+                    except Exception:
+                        try:
+                            await ctx.bot.send_message(
+                                int(aid),
+                                f"✅ Key back in rotation: #{num} {ks.masked} ({ks.site})",
+                                parse_mode=None)
+                        except Exception:
+                            pass
     if cur and all(cur.values()) and not all(prev.values()):
         for aid in _admin_ids():
             try:
-                await ctx.bot.send_message(int(aid), "🚨 ALL keys over budget/disabled! /resetusage or /add <key>")
+                await ctx.bot.send_message(int(aid), "🚨 ALL keys across all websites are over budget/disabled! /resetusage or /add <key>")
             except Exception:
                 pass
     ctx.bot_data["prev_over"] = cur

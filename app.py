@@ -92,11 +92,19 @@ class KeyState:
     site: str = "V1"
     disabled: bool = False
     exhausted: bool = False
+    exhausted_reason: str = ""
     cooldown_until: float = 0.0
 
     def __post_init__(self):
-        k = self.key
-        self.masked = f"{k[:7]}...{k[-4:]}" if len(k) > 12 else "***"
+        k = self.key.strip()
+        if len(k) > 12:
+            self.masked = f"{k[:7]}...{k[-4:]}"
+        elif len(k) >= 6:
+            self.masked = f"{k[:3]}...{k[-3:]}"
+        elif k:
+            self.masked = f"{k[:2]}..."
+        else:
+            self.masked = "unknown_key"
 
     def eff_token_limit(self) -> int:
         if self.token_limit < 0:
@@ -136,7 +144,7 @@ class KeyState:
         if self.disabled:
             return "disabled"
         if self.exhausted:
-            return "provider quota exhausted"
+            return self.exhausted_reason or "provider quota exhausted"
         import time
         if self.cooldown_until > time.time():
             left = int(self.cooldown_until - time.time())
@@ -303,9 +311,10 @@ class KeyPool:
             ks.fails += 1
         self.outbox.add(ks.key, fails=1)
 
-    async def mark_exhausted(self, ks: KeyState):
+    async def mark_exhausted(self, ks: KeyState, reason: str = "provider quota exhausted"):
         async with self._lock:
             ks.exhausted = True
+            ks.exhausted_reason = reason
             ks.fails += 1
         self.outbox.add(ks.key, fails=1)
 
@@ -436,6 +445,7 @@ class KeyPool:
                 ks.success = 0
                 ks.fails = 0
                 ks.exhausted = False
+                ks.exhausted_reason = ""
                 ks.cooldown_until = 0.0
         await self.outbox.reset(self.store, site_id, targets)
 
@@ -1305,13 +1315,22 @@ async def check_proxy_auth(request: Request,
     raise HTTPException(status_code=401, detail="Invalid proxy API key")
 
 
-def is_exhausted(status_code: int, body_text: str) -> bool:
-    if status_code == 402:
-        return True
-    if status_code in (401, 403):
-        return True
+def check_exhausted(status_code: int, body_text: str) -> Optional[str]:
     low = body_text.lower()
-    return any(m in low for m in EXHAUSTED_MARKERS)
+    if status_code == 402:
+        return "provider quota exhausted (402)"
+    if status_code == 401:
+        return "invalid/unauthorized key (401)"
+    if status_code == 403:
+        return "access forbidden (403)"
+    for m in EXHAUSTED_MARKERS:
+        if m in low:
+            return f"provider quota exhausted ({m})"
+    return None
+
+
+def is_exhausted(status_code: int, body_text: str) -> bool:
+    return check_exhausted(status_code, body_text) is not None
 
 
 def _retryable(status_code: int, body_text: str) -> bool:
@@ -1510,8 +1529,9 @@ async def proxy_request(request: Request):
                     last_error = f"{ks.masked} -> {sresp.status_code}: {text[:300]}"
                     last_text = text
                     last_status = sresp.status_code
-                    if is_exhausted(sresp.status_code, text):
-                        await pool.mark_exhausted(ks)
+                    ex_reason = check_exhausted(sresp.status_code, text)
+                    if ex_reason:
+                        await pool.mark_exhausted(ks, reason=ex_reason)
                     elif sresp.status_code == 429:
                         retry_sec = _parse_retry_after(sresp.headers.get("retry-after")) or 60.0
                         await pool.mark_rate_limited(ks, retry_sec)
@@ -1567,8 +1587,9 @@ async def proxy_request(request: Request):
             last_error = f"{ks.masked} -> {resp.status_code}: {text[:300]}"
             last_text = text
             last_status = resp.status_code
-            if is_exhausted(resp.status_code, text):
-                await pool.mark_exhausted(ks)
+            ex_reason = check_exhausted(resp.status_code, text)
+            if ex_reason:
+                await pool.mark_exhausted(ks, reason=ex_reason)
             elif resp.status_code == 429:
                 retry_sec = _parse_retry_after(resp.headers.get("retry-after")) or 60.0
                 await pool.mark_rate_limited(ks, retry_sec)
