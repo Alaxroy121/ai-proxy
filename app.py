@@ -30,6 +30,7 @@ X_TITLE = os.getenv("X_TITLE", "Key Rotating Proxy")
 # 0 = unlimited. Counts real `usage.total_tokens` when upstream reports it,
 # else estimates (chars // 4). Resets on restart, or via Telegram /resetusage.
 MAX_TOKENS_PER_KEY = int(os.getenv("MAX_TOKENS_PER_KEY", "0"))
+MAX_REQS_PER_KEY = int(os.getenv("MAX_REQS_PER_KEY", os.getenv("MAX_REQUESTS_PER_KEY", "0")))
 MAX_RETRIES_PER_REQUEST = int(os.getenv("MAX_RETRIES_PER_REQUEST", "10"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "120"))
 KEYS_FILE = os.getenv("KEYS_FILE", "keys.txt")
@@ -81,6 +82,8 @@ class KeyState:
     token_limit: int = 0
     site: str = "V1"
     disabled: bool = False
+    exhausted: bool = False
+    cooldown_until: float = 0.0
 
     def __post_init__(self):
         k = self.key
@@ -96,7 +99,7 @@ class KeyState:
         if self.req_limit > 0:
             return self.req_limit
         sb = site_req_budget(self.site)
-        return sb if sb > 0 else 0
+        return sb if sb > 0 else MAX_REQS_PER_KEY
 
     def over_budget(self) -> bool:
         tlim = self.eff_token_limit()
@@ -109,7 +112,33 @@ class KeyState:
 
     @property
     def available(self) -> bool:
-        return not self.disabled and not self.over_budget()
+        if self.disabled or self.exhausted:
+            return False
+        import time
+        if self.cooldown_until > time.time():
+            return False
+        return not self.over_budget()
+
+    def status_reason(self) -> str:
+        if self.disabled:
+            return "disabled"
+        if self.exhausted:
+            return "provider quota exhausted"
+        import time
+        if self.cooldown_until > time.time():
+            left = int(self.cooldown_until - time.time())
+            return f"rate-limited ({left}s cooldown)"
+        tlim = self.eff_token_limit()
+        rlim = self.eff_req_limit()
+        t_over = tlim > 0 and self.tokens_used >= tlim
+        r_over = rlim > 0 and self.req_used >= rlim
+        if t_over and r_over:
+            return "token & request limits hit"
+        if t_over:
+            return "token limit hit"
+        if r_over:
+            return "request limit hit"
+        return "in rotation"
 
 
 class Outbox:
@@ -256,6 +285,19 @@ class KeyPool:
             ks.fails += 1
         self.outbox.add(ks.key, fails=1)
 
+    async def mark_exhausted(self, ks: KeyState):
+        async with self._lock:
+            ks.exhausted = True
+            ks.fails += 1
+        self.outbox.add(ks.key, fails=1)
+
+    async def mark_rate_limited(self, ks: KeyState, seconds: float = 60.0):
+        import time
+        async with self._lock:
+            ks.cooldown_until = max(ks.cooldown_until, time.time() + max(5.0, seconds))
+            ks.fails += 1
+        self.outbox.add(ks.key, fails=1)
+
     async def set_token_limit(self, ident: str, limit: int) -> Optional[str]:
         async with self._lock:
             i = self._find_index(ident)
@@ -300,6 +342,8 @@ class KeyPool:
                 "eff_req_limit": ks.eff_req_limit(),
                 "over_budget": ks.over_budget(),
                 "disabled": ks.disabled,
+                "exhausted": ks.exhausted,
+                "status_reason": ks.status_reason(),
                 "success": ks.success,
                 "fails": ks.fails,
             }
@@ -373,6 +417,8 @@ class KeyPool:
                 ks.req_used = 0
                 ks.success = 0
                 ks.fails = 0
+                ks.exhausted = False
+                ks.cooldown_until = 0.0
         await self.outbox.reset(self.store, site_id, targets)
 
     async def reset_all(self):
@@ -712,57 +758,161 @@ def _num(v) -> int:
         return 0
 
 
-def extract_usage(data) -> tuple:
-    """Return (billable_tokens, cached_tokens).
+def estimate_tokens(text: str) -> int:
+    """Accurate token estimator for text (fallback when upstream omits usage)."""
+    if not text:
+        return 0
+    # Count CJK characters (~1.5 - 2 tokens per character in modern BPE tokenizers)
+    cjk_count = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+    non_cjk = re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', '', text)
+    words = len(non_cjk.split())
+    chars = len(non_cjk)
+    latin_tokens = max(chars // 4, int(words * 1.33))
+    total = latin_tokens + int(cjk_count * 1.5)
+    return max(1, total)
 
-    Cached tokens are already part of `total_tokens` / `prompt_tokens` in
-    OpenAI-compatible APIs, so they must NOT be added again. Anthropic is
-    the exception: its `input_tokens` excludes `cache_read_input_tokens`
-    and `cache_creation_input_tokens`, which are billed on top.
-    """
+
+def _extract_prompt_text(req_body: bytes) -> str:
+    """Extract actual prompt / messages text from request body for estimation."""
+    if not req_body:
+        return ""
+    try:
+        data = json.loads(req_body)
+    except Exception:
+        try:
+            return req_body.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
     if not isinstance(data, dict):
-        return 0, 0
-    u = data.get("usage")
+        return ""
+
+    parts: List[str] = []
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(str(part.get("text", "")))
+                    elif isinstance(part, str):
+                        parts.append(part)
+
+    prompt = data.get("prompt")
+    if isinstance(prompt, str):
+        parts.append(prompt)
+    elif isinstance(prompt, list):
+        for p in prompt:
+            if isinstance(p, str):
+                parts.append(p)
+
+    inp = data.get("input")
+    if isinstance(inp, str):
+        parts.append(inp)
+    elif isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, str):
+                parts.append(item)
+
+    system = data.get("system")
+    if isinstance(system, str):
+        parts.append(system)
+
+    tools = data.get("tools") or data.get("functions")
+    if tools:
+        try:
+            parts.append(json.dumps(tools))
+        except Exception:
+            pass
+
+    if parts:
+        return " ".join(parts)
+    try:
+        raw = req_body.decode("utf-8", errors="replace")
+        return raw if len(raw) < 10000 else ""
+    except Exception:
+        return ""
+
+
+def _extract_usage_dict(u: dict) -> tuple:
+    """Normalize usage dict across OpenAI, OpenRouter, Anthropic, Gemini, Ollama, DeepSeek.
+    Returns (prompt_tokens, completion_tokens, total_tokens, cached_tokens).
+    """
     if not isinstance(u, dict):
-        if any(k in data for k in _USAGE_KEYS):
-            u = data
-        else:
-            return 0, 0
+        return 0, 0, 0, 0
+
+    prompt = (
+        _num(u.get("prompt_tokens"))
+        or _num(u.get("input_tokens"))
+        or _num(u.get("promptTokenCount"))
+        or _num(u.get("prompt_token_count"))
+        or _num(u.get("prompt_eval_count"))
+    )
+
+    completion = (
+        _num(u.get("completion_tokens"))
+        or _num(u.get("output_tokens"))
+        or _num(u.get("candidatesTokenCount"))
+        or _num(u.get("candidates_token_count"))
+        or _num(u.get("eval_count"))
+    )
 
     det = u.get("prompt_tokens_details")
-    detail_cached = _num(det.get("cached_tokens")) if isinstance(det, dict) else 0
-    openai_cached = max(_num(u.get("cached_tokens")),
-                        _num(u.get("prompt_cache_hit_tokens")),
-                        detail_cached)
-    anthropic_cached = (_num(u.get("cache_read_input_tokens"))
-                        + _num(u.get("cache_creation_input_tokens")))
+    det_cached = _num(det.get("cached_tokens")) if isinstance(det, dict) else 0
+    openai_cached = max(
+        _num(u.get("cached_tokens")),
+        _num(u.get("prompt_cache_hit_tokens")),
+        _num(u.get("cachedContentTokenCount")),
+        _num(u.get("cached_content_token_count")),
+        det_cached,
+    )
+    anthropic_cached = (
+        _num(u.get("cache_read_input_tokens"))
+        + _num(u.get("cache_creation_input_tokens"))
+    )
     cached = max(openai_cached, anthropic_cached)
 
-    total = _num(u.get("total_tokens"))
-    if total > 0:
-        # OpenAI-style: total already includes cached prompt tokens.
-        return total, cached
+    total = (
+        _num(u.get("total_tokens"))
+        or _num(u.get("totalTokenCount"))
+        or _num(u.get("total_token_count"))
+    )
 
-    prompt, completion = u.get("prompt_tokens"), u.get("completion_tokens")
-    if prompt is not None or completion is not None:
-        return _num(prompt) + _num(completion), cached
+    # Anthropic native: input_tokens does NOT include cached tokens, which are billed on top
+    if anthropic_cached > 0 and not total and (u.get("input_tokens") is not None or u.get("output_tokens") is not None):
+        total = prompt + completion + anthropic_cached
+    elif total <= 0:
+        total = prompt + completion
+    else:
+        # total_tokens in OpenAI/Gemini includes cached tokens; make sure completion isn't dropped
+        total = max(total, prompt + completion)
 
-    inp, out = u.get("input_tokens"), u.get("output_tokens")
-    if inp is not None or out is not None:
-        return _num(inp) + _num(out) + anthropic_cached, anthropic_cached
-    return 0, 0
+    return prompt, completion, total, cached
 
 
-_USAGE_KEYS = ("total_tokens", "input_tokens", "prompt_tokens",
-                "output_tokens", "completion_tokens",
-                "cache_read_input_tokens", "cache_creation_input_tokens")
+_USAGE_KEYS = (
+    "total_tokens", "input_tokens", "prompt_tokens",
+    "output_tokens", "completion_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens",
+    "promptTokenCount", "candidatesTokenCount", "totalTokenCount",
+    "cachedContentTokenCount", "prompt_token_count", "candidates_token_count",
+    "total_token_count", "cached_content_token_count",
+    "prompt_eval_count", "eval_count"
+)
 
 
 def _find_usage(obj):
     if isinstance(obj, dict):
-        u = obj.get("usage")
+        u = obj.get("usage") or obj.get("usageMetadata") or obj.get("usage_metadata")
         if isinstance(u, dict) and any(k in u for k in _USAGE_KEYS):
             return u
+        if any(k in obj for k in _USAGE_KEYS):
+            return obj
         for v in obj.values():
             r = _find_usage(v)
             if r is not None:
@@ -775,62 +925,173 @@ def _find_usage(obj):
     return None
 
 
-def _usage_dicts_from_text(text: bytes) -> List[dict]:
-    """All usage blocks in an SSE stream, in order."""
+def extract_usage(data) -> tuple:
+    """Return (billable_tokens, cached_tokens)."""
+    if not isinstance(data, dict):
+        return 0, 0
+    u = _find_usage(data)
+    if not isinstance(u, dict):
+        return 0, 0
+    _, _, total, cached = _extract_usage_dict(u)
+    return total, cached
+
+
+def _extract_stream_text_and_usages(stream_bytes: bytes) -> tuple:
+    """Parse SSE stream to extract both generated text and all usage dicts."""
     try:
-        raw = text.decode("utf-8", errors="replace")
+        raw = stream_bytes.decode("utf-8", errors="replace")
     except Exception:
-        return []
-    out: List[dict] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("data:"):
-            line = line[5:].strip()
-        if not line.startswith("{"):
+        return "", []
+
+    usages: List[dict] = []
+    text_parts: List[str] = []
+    blocks = re.split(r'\r?\n\r?\n', raw)
+    for block in blocks:
+        if not block.strip():
+            continue
+        data_lines: List[str] = []
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if not data_lines:
+            if block.strip().startswith("{") and block.strip().endswith("}"):
+                data_lines.append(block.strip())
+            else:
+                continue
+        payload = "\n".join(data_lines).strip()
+        if not payload or payload == "[DONE]":
             continue
         try:
-            obj = json.loads(line)
+            obj = json.loads(payload)
         except Exception:
             continue
-        u = _find_usage(obj)
-        if isinstance(u, dict):
-            out.append(u)
-    return out
+
+        if isinstance(obj, dict):
+            u = _find_usage(obj)
+            if isinstance(u, dict):
+                usages.append(u)
+
+            # OpenAI chat chunk
+            choices = obj.get("choices")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0]
+                if isinstance(c0, dict):
+                    delta = c0.get("delta")
+                    if isinstance(delta, dict):
+                        if delta.get("content"):
+                            text_parts.append(str(delta["content"]))
+                        if delta.get("reasoning_content"):
+                            text_parts.append(str(delta["reasoning_content"]))
+                    elif c0.get("text"):
+                        text_parts.append(str(c0["text"]))
+            # Anthropic streaming chunk
+            if obj.get("type") == "content_block_delta":
+                delta = obj.get("delta")
+                if isinstance(delta, dict) and delta.get("text"):
+                    text_parts.append(str(delta["text"]))
+            # Gemini streaming chunk
+            candidates = obj.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                cand0 = candidates[0]
+                if isinstance(cand0, dict):
+                    parts = cand0.get("content", {}).get("parts", [])
+                    for p in parts:
+                        if isinstance(p, dict) and p.get("text"):
+                            text_parts.append(str(p["text"]))
+            # Ollama streaming chunk
+            if obj.get("response"):
+                text_parts.append(str(obj["response"]))
+
+    return "".join(text_parts), usages
 
 
 def _combine_stream_usage(usages: List[dict]) -> tuple:
-    """Merge stream usage chunks (OpenAI final chunk or Anthropic events)."""
+    """Merge stream usage chunks (OpenAI final chunk, Anthropic events, Gemini, etc.)."""
     if not usages:
         return 0, 0
-    openai_style = any("total_tokens" in u or "prompt_tokens" in u for u in usages)
-    if openai_style:
-        best = (0, 0)
-        for u in usages:
-            total, cached = extract_usage({"usage": u})
-            if total > best[0]:
-                best = (total, cached)
-        return best
-    # Anthropic: input/cache live in message_start, output in message_delta.
-    inp = max(_num(u.get("input_tokens")) for u in usages)
-    out = max(_num(u.get("output_tokens")) for u in usages)
-    cr = max(_num(u.get("cache_read_input_tokens")) for u in usages)
-    cc = max(_num(u.get("cache_creation_input_tokens")) for u in usages)
-    return inp + out + cr + cc, cr + cc
+    max_prompt = 0
+    max_completion = 0
+    max_total = 0
+    max_cached = 0
+    is_anthropic = False
+
+    for u in usages:
+        p, c, tot, cach = _extract_usage_dict(u)
+        if p > max_prompt:
+            max_prompt = p
+        if c > max_completion:
+            max_completion = c
+        if tot > max_total:
+            max_total = tot
+        if cach > max_cached:
+            max_cached = cach
+        if "cache_read_input_tokens" in u or "cache_creation_input_tokens" in u:
+            is_anthropic = True
+
+    if is_anthropic:
+        total = max_prompt + max_completion + max_cached
+        return total, max_cached
+
+    calc_total = max_prompt + max_completion
+    final_total = max(max_total, calc_total)
+    return final_total, max_cached
 
 
 def count_tokens(req_body: bytes, resp_body: bytes, data=None) -> tuple:
     total, cached = extract_usage(data)
     if total > 0:
         return total, cached
-    est = (len(req_body) + len(resp_body)) // 4 or 1
-    return est, 0
+
+    # Fallback estimation when upstream omits usage block
+    prompt_text = _extract_prompt_text(req_body)
+    comp_text = ""
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            c0 = choices[0]
+            if isinstance(c0, dict):
+                msg = c0.get("message")
+                if isinstance(msg, dict) and msg.get("content"):
+                    comp_text = str(msg["content"])
+                elif c0.get("text"):
+                    comp_text = str(c0["text"])
+        if not comp_text and data.get("content"):
+            content = data["content"]
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("text"):
+                        comp_text += str(c["text"])
+            elif isinstance(content, str):
+                comp_text = content
+    prompt_est = estimate_tokens(prompt_text)
+    comp_est = estimate_tokens(comp_text)
+    if prompt_est or comp_est:
+        return max(1, prompt_est + comp_est), 0
+    return max(1, (len(req_body) + len(resp_body)) // 4), 0
 
 
 def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
-    total, cached = _combine_stream_usage(_usage_dicts_from_text(stream_bytes))
+    gen_text, usages = _extract_stream_text_and_usages(stream_bytes)
+    total, cached = _combine_stream_usage(usages)
     if total > 0:
         return total, cached
-    return (len(req_body) + len(stream_bytes)) // 4 or 1, 0
+
+    # Fallback estimation: use actual prompt + generated text, not raw SSE wire overhead
+    prompt_text = _extract_prompt_text(req_body)
+    prompt_est = estimate_tokens(prompt_text)
+    comp_est = estimate_tokens(gen_text)
+    est_total = max(1, prompt_est + comp_est)
+    return est_total, 0
+
+
+def _parse_retry_after(header: Optional[str]) -> Optional[float]:
+    if not header:
+        return None
+    try:
+        return max(5.0, min(3600.0, float(header.strip())))
+    except ValueError:
+        return None
 
 
 @asynccontextmanager
@@ -1069,9 +1330,13 @@ async def proxy_request(request: Request):
 
     params_note = f"{request.method} {upstream_path}"
     last_error: Optional[str] = None
+    last_text: str = ""
     last_status: int = 502
     tried = 0
-    max_tries = min(MAX_RETRIES_PER_REQUEST, pool.size * 2)
+    # Retry only across keys that belong to this site. A one-key site must
+    # not hammer the same key 30 times when the provider says 402/429.
+    site_key_count = sum(1 for k in pool.keys if site_id is None or k.site == site_id)
+    max_tries = max(1, min(MAX_RETRIES_PER_REQUEST, site_key_count))
     want_stream = _wants_stream(request, body)
     tried_keys: set = set()
 
@@ -1081,6 +1346,10 @@ async def proxy_request(request: Request):
             sid = site_id
             ks = await pool.next_key(sid, skip=tried_keys)
             if ks is None:
+                if tried and last_error:
+                    return JSONResponse(
+                        status_code=last_status,
+                        content={"error": last_text or last_error, "proxy_note": params_note})
                 raise HTTPException(
                     status_code=503,
                     detail=f"No usable keys for site {sid}. Budgets full, disabled, or none assigned.",
@@ -1093,12 +1362,16 @@ async def proxy_request(request: Request):
 
             if want_stream:
                 body_out = body
-                if upstream_path == "/chat/completions":
+                clean_path = upstream_path.split("?")[0].rstrip("/")
+                if clean_path.endswith("/chat/completions") or clean_path.endswith("/completions"):
                     try:
                         payload = json.loads(body) if body else {}
                         if isinstance(payload, dict):
-                            so = payload.get("stream_options") or {}
-                            if isinstance(so, dict) and "include_usage" not in so:
+                            so = payload.get("stream_options")
+                            if not isinstance(so, dict):
+                                payload["stream_options"] = {"include_usage": True}
+                                body_out = json.dumps(payload).encode()
+                            elif "include_usage" not in so:
                                 so["include_usage"] = True
                                 payload["stream_options"] = so
                                 body_out = json.dumps(payload).encode()
@@ -1122,8 +1395,15 @@ async def proxy_request(request: Request):
                     except Exception:
                         text = ""
                     last_error = f"{ks.masked} -> {sresp.status_code}: {text[:300]}"
+                    last_text = text
                     last_status = sresp.status_code
-                    await pool.mark_failed(ks)
+                    if is_exhausted(sresp.status_code, text):
+                        await pool.mark_exhausted(ks)
+                    elif sresp.status_code == 429:
+                        retry_sec = _parse_retry_after(sresp.headers.get("retry-after")) or 60.0
+                        await pool.mark_rate_limited(ks, retry_sec)
+                    else:
+                        await pool.mark_failed(ks)
                     if _retryable(sresp.status_code, text):
                         continue
                     return JSONResponse(status_code=sresp.status_code,
@@ -1141,7 +1421,10 @@ async def proxy_request(request: Request):
                             await _r.aclose()
                         finally:
                             await _c.aclose()
-                        await pool.add_usage(_k, *count_stream_tokens(_b, bytes(buf)))
+                        try:
+                            await pool.add_usage(_k, *count_stream_tokens(_b, bytes(buf)))
+                        except Exception as e:
+                            print(f"[usage] stream count error for {_k.masked}: {e}")
 
                 return StreamingResponse(gen(), status_code=sresp.status_code,
                                         media_type="text/event-stream")
@@ -1169,16 +1452,24 @@ async def proxy_request(request: Request):
             except Exception:
                 text = ""
             last_error = f"{ks.masked} -> {resp.status_code}: {text[:300]}"
+            last_text = text
             last_status = resp.status_code
-            await pool.mark_failed(ks)
+            if is_exhausted(resp.status_code, text):
+                await pool.mark_exhausted(ks)
+            elif resp.status_code == 429:
+                retry_sec = _parse_retry_after(resp.headers.get("retry-after")) or 60.0
+                await pool.mark_rate_limited(ks, retry_sec)
+            else:
+                await pool.mark_failed(ks)
 
             if _retryable(resp.status_code, text):
                 continue
 
             return JSONResponse(status_code=resp.status_code, content={"error": text, "proxy_note": params_note})
 
-    raise HTTPException(status_code=last_status if last_status != 502 else 503,
-                        detail=f"All keys failed after {tried} tries. Last: {last_error}")
+    return JSONResponse(status_code=last_status,
+                        content={"error": last_text or last_error or "All keys failed",
+                                 "proxy_note": params_note})
 
 
 for _path in [

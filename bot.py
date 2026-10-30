@@ -93,19 +93,41 @@ MAIN_KEYBOARD = InlineKeyboardMarkup([
 HOME_BUTTON = InlineKeyboardButton("🏠 Panel", callback_data="panel")
 
 
+def _site_badge(keys) -> str:
+    if not keys:
+        return "⚪"
+    usable = sum(1 for k in keys if k.available)
+    if usable == 0:
+        return "⛔"
+    return "✅" if usable == len(keys) else "⚠️"
+
+
 def panel_text(pool) -> str:
     import app as appmod
     total = len(pool.keys)
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
-    cap = _cap_sum(pool.keys)
-    overall = _bar(used, cap)
+    overall_tokens = _bar(used, _cap_sum(pool.keys))
+    req_used = sum(k.req_used for k in pool.keys)
+    req_cap = _req_cap_sum(pool.keys)
+    has_req = any(k.eff_req_limit() > 0 for k in pool.keys)
+    req_line = f"🧾 Requests {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}\n" if has_req else ""
+    site_lines = []
+    for s in appmod.sites.sites:
+        keys = [k for k in pool.keys if k.site == s["id"]]
+        site_lines.append(
+            f"{_site_badge(keys)} `{s['id']}` {sum(1 for k in keys if k.available)}/{len(keys)}")
+    store = "ok" if getattr(pool, "store_ok", True) else "lag"
+    pend = pool.pending_count()
+    tail = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
     return (
-        "🤖 *Proxy control panel*\n"
-        "Each path serves its site: /v1→V1, /v2→V2, …\n"
-        f"🌐 `{', '.join(s['id'] for s in appmod.sites.sites) or 'none'}` · 🔑 {avail}/{total} keys\n"
-        f"📊 overall {overall}\n"
-        "📈 Live progress auto-pushes at 50/80/100%."
+        "🤖 *Proxy Control*\n"
+        f"🔑 *{avail}/{total}* keys · 💾 {store}\n"
+        f"{chr(10).join(site_lines) or '`no sites`'}\n\n"
+        f"📊 Tokens {overall_tokens}\n"
+        f"{req_line}"
+        "🎯 Key 1 → 2 → 3 as limits fill\n"
+        "📈 Live alerts at 50 / 80 / 100%" + tail
     )
 
 
@@ -127,6 +149,10 @@ def stats_keyboard(pool, site_id=None) -> InlineKeyboardMarkup:
         rows.append(row)
     if site_id:
         rows.append([
+            InlineKeyboardButton("🧠 Models", callback_data=f"models:{site_id}"),
+            InlineKeyboardButton("🌐 Site", callback_data=f"site:{site_id}"),
+        ])
+        rows.append([
             InlineKeyboardButton("🌐 Websites", callback_data="stats"),
             HOME_BUTTON,
         ])
@@ -134,6 +160,9 @@ def stats_keyboard(pool, site_id=None) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton("🔄 Refresh", callback_data="refresh:stats"),
             InlineKeyboardButton("♻️ Reset", callback_data="reset:ask"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🌐 Sites", callback_data="sites"),
             HOME_BUTTON,
         ])
     return InlineKeyboardMarkup(rows)
@@ -143,23 +172,56 @@ async def stats_picker_keyboard(pool) -> InlineKeyboardMarkup:
     import app as appmod
     rows = []
     for s in await appmod.sites.list_sites():
-        n = sum(1 for k in pool.keys if k.site == s["id"])
-        rows.append([InlineKeyboardButton(f"🌐 {s['id']} ({n} keys)", callback_data=f"statssite:{s['id']}")])
+        keys = [k for k in pool.keys if k.site == s["id"]]
+        usable = sum(1 for k in keys if k.available)
+        rows.append([InlineKeyboardButton(
+            f"{_site_badge(keys)} {s['id']} · {usable}/{len(keys)} keys",
+            callback_data=f"statssite:{s['id']}")])
     rows.append([InlineKeyboardButton("🌍 All sites", callback_data="statssite:ALL")])
-    rows.append([HOME_BUTTON])
+    rows.append([InlineKeyboardButton("🌐 Sites", callback_data="sites"), HOME_BUTTON])
     return InlineKeyboardMarkup(rows)
 
 
 def health_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Stats", callback_data="stats"),
+         InlineKeyboardButton("🌐 Sites", callback_data="sites")],
         [InlineKeyboardButton("🔄 Refresh", callback_data="refresh:health"),
          HOME_BUTTON],
     ])
 
 
-async def sites_keyboard() -> InlineKeyboardMarkup:
+def sites_keyboard(pool=None) -> InlineKeyboardMarkup:
+    import app as appmod
+    rows = []
+    for s in appmod.sites.sites:
+        keys = [k for k in pool.keys if k.site == s["id"]] if pool is not None else []
+        usable = sum(1 for k in keys if k.available)
+        rows.append([InlineKeyboardButton(
+            f"{_site_badge(keys)} {s['id']} · {usable}/{len(keys)} keys",
+            callback_data=f"site:{s['id']}")])
+    rows.append([InlineKeyboardButton("📊 Stats", callback_data="stats"),
+                 InlineKeyboardButton("❤️ Health", callback_data="health")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
+                 HOME_BUTTON])
+    return InlineKeyboardMarkup(rows)
+
+
+def site_detail_keyboard(sid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh:sites"),
+        [InlineKeyboardButton("📊 Keys", callback_data=f"statssite:{sid}"),
+         InlineKeyboardButton("🧠 Models", callback_data=f"models:{sid}")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"site:{sid}"),
+         InlineKeyboardButton("🌐 Websites", callback_data="sites")],
+        [HOME_BUTTON],
+    ])
+
+
+def models_keyboard(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh models", callback_data=f"models:{sid}:r"),
+         InlineKeyboardButton("🌐 Site", callback_data=f"site:{sid}")],
+        [InlineKeyboardButton("🌐 Websites", callback_data="sites"),
          HOME_BUTTON],
     ])
 
@@ -175,30 +237,144 @@ async def render_sites(pool=None) -> str:
     import time
     lines = []
     for s in await appmod.sites.list_sites():
-        nkeys = ""
-        if pool is not None:
-            n = sum(1 for k in pool.keys if k.site == s["id"])
-            nkeys = f" ({n} keys)"
+        keys = [k for k in pool.keys if k.site == s["id"]] if pool is not None else []
+        usable = sum(1 for k in keys if k.available)
+        keys_note = f"{usable}/{len(keys)}"
         rh = s.get("reset_hours") or 0
         if rh > 0:
             left = max(0, rh * 3600 - (time.time() - (s.get("last_reset") or 0)))
             hrs = int(left // 3600)
             mins = int((left % 3600) // 60)
-            sched = f" 🔁 {rh:g}h (next ~{hrs}h{mins:02d}m)"
+            sched = f" · 🔁 {rh:g}h (~{hrs}h{mins:02d}m)"
         else:
             sched = ""
         bits = ""
         if (s.get("token_budget") or 0) > 0:
-            bits += f" [lim {_fmt(s['token_budget'])}]"
+            bits += f" · lim {_fmt(s['token_budget'])}"
         if (s.get("req_budget") or 0) > 0:
-            bits += f" [req {_fmt(s['req_budget'])}]"
+            bits += f" · req {_fmt(s['req_budget'])}"
         if (s.get("timeout") or 0) > 0:
-            bits += f" [t/o {s['timeout']}s]"
+            bits += f" · t/o {s['timeout']}s"
         if s.get("referer") or s.get("title"):
-            bits += " [H]"
-        lines.append(f"`{s['id']}` `{s['url']}`{nkeys}{sched}{bits}")
-    return "🌐 *websites — one path per site*\n" + "\n".join(lines or ["(none)"]) + \
-        "\n\n`/v1/…` → V1 only, `/v2/…` → V2 only."
+            bits += " · H"
+        lines.append(f"{_site_badge(keys)} `{s['id']}` {keys_note} · `{s['url']}`{sched}{bits}")
+    return ("🌐 *Websites — tap one for details*\n" + "\n".join(lines or ["(none)"]) +
+            "\n\n`/v1/…`→V1 · `/v2/…`→V2 · each path uses only that site.")
+
+
+async def render_site_detail(pool, sid: str) -> str:
+    import app as appmod
+    import time
+    sid = appmod.SiteManager.norm(sid)
+    site = appmod.sites.get_site(sid)
+    if site is None:
+        return "❓ Unknown site."
+    keys = [k for k in pool.keys if k.site == sid]
+    usable = sum(1 for k in keys if k.available)
+    used = sum(k.tokens_used for k in keys)
+    nxt = await pool.next_key(sid)
+    nxt_txt = "none available"
+    if nxt is not None:
+        num = next((i for i, k in enumerate(pool.keys, 1) if k is nxt), "?")
+        nxt_txt = f"`{nxt.masked}` (#{num})"
+    lines = [
+        f"🌐 *{sid}*",
+        f"`{site['url']}`",
+        "",
+        f"🔑 *{usable}/{len(keys)}* keys usable",
+        f"▶️ Next key: {nxt_txt}",
+        f"📊 Tokens: {_bar(used, _cap_sum(keys))}",
+    ]
+    req_used = sum(k.req_used for k in keys)
+    req_caps = [k.eff_req_limit() for k in keys]
+    if any(c > 0 for c in req_caps):
+        if all(c > 0 for c in req_caps):
+            lines.append(f"🧾 Requests: `{req_used}/{sum(req_caps)}`")
+        else:
+            lines.append(f"🧾 Requests: `{req_used}` (mixed limits)")
+    rh = site.get("reset_hours") or 0
+    if rh > 0:
+        left = max(0, rh * 3600 - (time.time() - (site.get("last_reset") or 0)))
+        hrs, mins = int(left // 3600), int((left % 3600) // 60)
+        lines.append(f"🔁 Auto-reset: every {rh:g}h · next ~{hrs}h{mins:02d}m")
+    else:
+        lines.append("🔁 Auto-reset: off")
+    if (site.get("token_budget") or 0) > 0:
+        lines.append(f"⚙️ Token budget/key: `{_fmt(site['token_budget'])}`")
+    if (site.get("req_budget") or 0) > 0:
+        lines.append(f"⚙️ Request budget/key: `{site['req_budget']:,}`")
+    if (site.get("timeout") or 0) > 0:
+        lines.append(f"⏱ Timeout: `{site['timeout']}s`")
+    if site.get("referer") or site.get("title"):
+        lines.append("🏷 Custom headers: on")
+    lines.append("")
+    lines.append("Tap 🧠 *Models* to see the exact model names this site accepts.")
+    return "\n".join(lines)
+
+
+async def fetch_site_models(pool, sid: str, bot_data, force: bool = False) -> str:
+    """Fetch /models from one site so V4 etc. are easy to verify."""
+    import app as appmod
+    import httpx
+    import time
+    sid = appmod.SiteManager.norm(sid)
+    site = appmod.sites.get_site(sid)
+    if site is None:
+        return "❓ Unknown site."
+    cache = bot_data.setdefault("models_cache", {})
+    now = time.time()
+    hit = cache.get(sid)
+    if hit and not force and now - hit[0] < 300:
+        models, err = hit[1], hit[2]
+    else:
+        models, err = [], ""
+        keys = [k for k in pool.keys if k.site == sid]
+        key = next((k for k in keys if k.available), keys[0] if keys else None)
+        if key is None:
+            err = "no key assigned to this site"
+        else:
+            url = f"{site['url'].rstrip('/')}/models"
+            headers = {"Accept": "application/json"}
+            if site.get("referer") or appmod.HTTP_REFERER:
+                headers["HTTP-Referer"] = site.get("referer") or appmod.HTTP_REFERER
+            if site.get("title") or appmod.X_TITLE:
+                headers["X-Title"] = site.get("title") or appmod.X_TITLE
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(
+                        url, headers={**headers, "Authorization": f"Bearer {key.key}"})
+                    if resp.status_code in (401, 403):
+                        resp = await client.get(
+                            url, headers={**headers, "X-Api-Key": key.key})
+                if resp.status_code >= 400:
+                    err = f"HTTP {resp.status_code}: {resp.text[:160]}"
+                else:
+                    data = resp.json()
+                    arr = data if isinstance(data, list) else (
+                        data.get("data") or data.get("models") or [])
+                    seen = set()
+                    for m in arr:
+                        mid = m if isinstance(m, str) else (
+                            m.get("id") if isinstance(m, dict) else None)
+                        if mid and mid not in seen:
+                            seen.add(mid)
+                            models.append(str(mid))
+                    if not models:
+                        err = "upstream returned no models"
+            except Exception as e:
+                err = str(e)[:160]
+        cache[sid] = (now, models, err)
+
+    if err:
+        return (f"🧠 *{sid} models*\n`{site['url']}`\n\n"
+                f"❌ `{err}`\n\nCheck `/siteuse {sid} <url>` or the site key.")
+    show = models[:30]
+    lines = [f"🧠 *{sid} models*", f"`{site['url']}`", ""]
+    lines += [f"{i}. `{m}`" for i, m in enumerate(show, 1)]
+    if len(models) > len(show):
+        lines.append(f"… +{len(models) - len(show)} more")
+    lines += ["", f"Use the exact name with `/v{sid[1:]}/chat/completions`."]
+    return "\n".join(lines)
 
 
 def _admin_ids() -> set:
@@ -242,25 +418,33 @@ def _cap_sum(keys) -> int:
     return sum(caps) if caps and all(c > 0 for c in caps) else 0
 
 
+def _req_cap_sum(keys) -> int:
+    """Total request capacity, or 0 when at least one key is unlimited."""
+    caps = [ks.eff_req_limit() for ks in keys]
+    return sum(caps) if caps and all(c > 0 for c in caps) else 0
+
+
 def _stats_lines(items) -> list[str]:
     """items: [(1-based number, KeyState)]. Numbers stay global (toggle/rm use them)."""
     lines = []
     for i, ks in items:
         if ks.disabled:
-            state, extra = "⛔", "disabled"
-        elif ks.over_budget():
-            state, extra = "❌", "over budget"
+            state = "⛔"
+        elif ks.available:
+            state = "✅"
         else:
-            state, extra = "✅", "in rotation"
-        bits = f"{_bar(ks.tokens_used, ks.eff_token_limit())} ok={ks.success} fail={ks.fails}"
+            state = "❌"
+        extra = ks.status_reason() if hasattr(ks, "status_reason") else ("over budget" if ks.over_budget() else "in rotation")
+        bits = f"{_bar(ks.tokens_used, ks.eff_token_limit())}"
+        if ks.eff_req_limit() > 0:
+            bits += f" | req {_bar(ks.req_used, ks.eff_req_limit(), width=8)}"
+        elif ks.req_used:
+            bits += f" | req {ks.req_used:,}"
+        bits += f" ok={ks.success} fail={ks.fails}"
         if ks.cached_tokens:
             bits += f" ({_fmt(ks.cached_tokens)} cached)"
         if ks.token_limit:
             bits += f" [lim {_fmt(ks.token_limit)}]"
-        if ks.req_limit:
-            bits += f" [req {ks.req_used:,}/{ks.req_limit:,}]"
-        elif ks.req_used:
-            bits += f" [req {ks.req_used:,}]"
         lines.append(f"{i}. {state} `{ks.masked}` {bits} ({extra})")
     return lines or ["(no keys)"]
 
@@ -309,13 +493,19 @@ def render_stats(pool, site_filter=None) -> str:
         used = sum(ks.tokens_used for _, ks in items)
         cap = _cap_sum([ks for _, ks in items])
         overall = _bar(used, cap)
-        sections.append(f"{title}\n📊 overall ({sid}) {overall}\n" + "\n".join(_stats_lines(items)))
+        req_used = sum(ks.req_used for _, ks in items)
+        req_cap = _req_cap_sum([ks for _, ks in items])
+        req_line = f" · 🧾 {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}" if (req_cap or req_used) else ""
+        sections.append(f"{title}\n📊 ({sid}) {overall}{req_line}\n" + "\n".join(_stats_lines(items)))
     body = "\n\n".join(sections) or "(no keys on this site)"
     if site_filter is None:
         all_used = sum(k.tokens_used for k in pool.keys)
         all_cap = _cap_sum(pool.keys)
         grand = _bar(all_used, all_cap)
-        body = f"🌍 *overall (all sites)* {grand}\n\n" + body
+        all_reqs = sum(k.req_used for k in pool.keys)
+        all_rcap = _req_cap_sum(pool.keys)
+        req_grand = f"\n🧾 *overall reqs* {_bar(all_reqs, all_rcap) if all_rcap else f'`{all_reqs:,}` reqs'}" if any(k.eff_req_limit() > 0 for k in pool.keys) else ""
+        body = f"🌍 *overall tokens* {grand}{req_grand}\n\n" + body
     if pool.pending_count() and site_filter is None:
         body += f"\n\n⚠️ `{pool.pending_count()}` updates not yet saved to store"
     return f"🔑 *keys by website*\n\n{body}"
@@ -343,7 +533,8 @@ def render_config(pool=None) -> str:
         f"mode: one path per site — /v1→V1, /v2→V2 (X-Site overrides)\n"
         f"websites:\n{sitelines}\n"
         f"token budget/key: `{appmod.MAX_TOKENS_PER_KEY}` (0 = unlimited)\n"
-        f"live milestones: `50/80/100%`\n"
+        f"request budget/key: `{getattr(appmod, 'MAX_REQS_PER_KEY', 0)}` (0 = unlimited)\n"
+        f"live milestones: `50/80/100%` (tokens & requests)\n"
         f"auto digest: `{os.getenv('LIVE_DIGEST_MIN', '0')} min (0 = off)`\n"
         f"store: `{store}`\n"
         f"max retries: `{appmod.MAX_RETRIES_PER_REQUEST}`\n"
@@ -404,13 +595,27 @@ async def _route_button(data: str, pool, ctx, update=None):
                     "Tap `/` to see them (reopen chat if cached)."), MAIN_KEYBOARD
         return f"❌ Menu sync failed: `{info}`", MAIN_KEYBOARD
     if data == "sites":
-        return await render_sites(pool), await sites_keyboard()
+        return await render_sites(pool), sites_keyboard(pool)
+    if data.startswith("site:"):
+        import app as _appmod
+        sid = _appmod.SiteManager.norm(data.split(":", 1)[1])
+        if _appmod.sites.get_site(sid) is None:
+            return "❓ Unknown site.", sites_keyboard(pool)
+        return await render_site_detail(pool, sid), site_detail_keyboard(sid)
+    if data.startswith("models:"):
+        parts = data.split(":")
+        import app as _appmod
+        sid = _appmod.SiteManager.norm(parts[1] if len(parts) > 1 else "")
+        if _appmod.sites.get_site(sid) is None:
+            return "❓ Unknown site.", sites_keyboard(pool)
+        force = len(parts) > 2 and parts[2] == "r"
+        return await fetch_site_models(pool, sid, ctx.bot_data, force), models_keyboard(sid)
     if data == "refresh:stats":
         return render_stats(pool), stats_keyboard(pool)
     if data == "refresh:health":
         return _make_health(pool), health_keyboard()
     if data == "refresh:sites":
-        return await render_sites(pool), await sites_keyboard()
+        return await render_sites(pool), sites_keyboard(pool)
     if data.startswith("tg:"):
         parts = data.split(":")
         num = parts[1] if len(parts) > 1 else ""
@@ -430,10 +635,10 @@ async def _route_button(data: str, pool, ctx, update=None):
         sid = appmod.SiteManager.norm(data.split(":", 1)[1])
         hit = next((s for s in appmod.sites.sites if s["id"] == sid), None)
         if hit is None:
-            return "❓ Unknown site.", await sites_keyboard()
+            return "❓ Unknown site.", sites_keyboard(pool)
         nkeys = sum(1 for k in pool.keys if k.site == sid)
         return (f"`{sid}` → `{hit['url']}` ({nkeys} keys)\n"
-                f"Fix it: `/siteuse {sid} <new-url>`"), await sites_keyboard()
+                f"Fix it: `/siteuse {sid} <new-url>`"), sites_keyboard(pool)
     if data == "reset:ask":
         return "⚠️ Zero *all* token/request counters?", RESET_CONFIRM_KEYBOARD
     if data == "reset:yes":
@@ -515,17 +720,32 @@ def _make_health(pool):
     total = len(pool.keys)
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
-    cap = _cap_sum(pool.keys)
-    budget = _bar(used, cap)
     pend = pool.pending_count()
-    extra = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
-    ids = ", ".join(s["id"] for s in appmod.sites.sites) or "none"
-    return (
-        f"❤️ *health*\n"
-        f"sites: `{ids}` (/v1→V1, /v2→V2…)\n"
-        f"keys: {avail}/{total} usable\n"
-        f"tokens total: {budget}{extra}"
-    )
+    store = "ok" if getattr(pool, "store_ok", True) else "⚠️ failing"
+    req_used = sum(k.req_used for k in pool.keys)
+    req_cap = _req_cap_sum(pool.keys)
+    has_req = any(k.eff_req_limit() > 0 for k in pool.keys)
+
+    lines = [
+        "❤️ *Health*",
+        f"🔑 Keys: *{avail}/{total}* usable · 💾 {store}",
+        f"📊 Tokens total: {_bar(used, _cap_sum(pool.keys))}",
+    ]
+    if has_req:
+        lines.append(f"🧾 Requests total: {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}")
+
+    for s in appmod.sites.sites:
+        keys = [k for k in pool.keys if k.site == s["id"]]
+        su = sum(1 for k in keys if k.available)
+        s_rcap = _req_cap_sum(keys)
+        req_bit = f" · req {_bar(sum(k.req_used for k in keys), s_rcap)}" if s_rcap else ""
+        lines.append(
+            f"{_site_badge(keys)} `{s['id']}` {su}/{len(keys)} · "
+            f"{_bar(sum(k.tokens_used for k in keys), _cap_sum(keys))}{req_bit}")
+    if pend:
+        lines.append(f"⚠️ `{pend}` updates unsynced")
+    lines.append("`/v1/…`→V1 · `/v2/…`→V2 · each path isolated")
+    return "\n".join(lines)
 
 
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -740,7 +960,8 @@ async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
     await update.message.reply_text(await render_sites(ctx.bot_data["pool"]),
-                                    parse_mode="Markdown", reply_markup=await sites_keyboard())
+                                    parse_mode="Markdown",
+                                    reply_markup=sites_keyboard(ctx.bot_data["pool"]))
 
 
 async def cmd_siteadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -893,38 +1114,64 @@ def _pct(used: int, limit: int) -> int:
 
 
 async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
-    """Live usage pushes: milestones 50/80/100% per key + optional digest."""
+    """Live usage pushes: milestones 50/80/100% per key for BOTH tokens and requests."""
     import time
     import app as appmod
     pool = ctx.bot_data["pool"]
     ms: dict = ctx.bot_data.setdefault("ms", {})
     seeded = "ms_seeded" in ctx.bot_data
+
     for ks in pool.keys:
-        lim = ks.eff_token_limit()
-        if lim <= 0:
-            ms.pop(ks.masked, None)
-            continue
-        pct = _pct(ks.tokens_used, lim)
-        prev = ms.get(ks.masked)
-        if not seeded:
-            ms[ks.masked] = pct  # silent baseline, no spam after restart
-            continue
-        if pct < (prev or 0):
-            # auto/manual reset: re-arm milestones from zero
-            ms[ks.masked] = pct
-            continue
-        hit = [m for m in MILESTONES if (prev or 0) < m <= pct]
-        ms[ks.masked] = pct
-        if hit:
-            bar = _bar(ks.tokens_used, ks.eff_token_limit())
-            for aid in _admin_ids():
-                try:
-                    await ctx.bot.send_message(
-                        int(aid),
-                        f"📈 `{ks.masked}` hit {hit[-1]}%\n{bar}",
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
+        # 1. Token limit milestone tracking
+        tlim = ks.eff_token_limit()
+        if tlim > 0:
+            tpct = _pct(ks.tokens_used, tlim)
+            tprev = ms.get(f"token:{ks.masked}")
+            if not seeded:
+                ms[f"token:{ks.masked}"] = tpct
+            elif tpct < (tprev or 0):
+                ms[f"token:{ks.masked}"] = tpct
+            else:
+                thit = [m for m in MILESTONES if (tprev or 0) < m <= tpct]
+                ms[f"token:{ks.masked}"] = tpct
+                if thit:
+                    bar = _bar(ks.tokens_used, tlim)
+                    for aid in _admin_ids():
+                        try:
+                            await ctx.bot.send_message(
+                                int(aid),
+                                f"📈 🪙 Token limit: `{ks.masked}` hit {thit[-1]}%\n{bar}\n🎯 Shift to next key at 100%",
+                                parse_mode="Markdown")
+                        except Exception:
+                            pass
+        else:
+            ms.pop(f"token:{ks.masked}", None)
+
+        # 2. Request limit milestone tracking (treated identically to token limit)
+        rlim = ks.eff_req_limit()
+        if rlim > 0:
+            rpct = _pct(ks.req_used, rlim)
+            rprev = ms.get(f"req:{ks.masked}")
+            if not seeded:
+                ms[f"req:{ks.masked}"] = rpct
+            elif rpct < (rprev or 0):
+                ms[f"req:{ks.masked}"] = rpct
+            else:
+                rhit = [m for m in MILESTONES if (rprev or 0) < m <= rpct]
+                ms[f"req:{ks.masked}"] = rpct
+                if rhit:
+                    rbar = _bar(ks.req_used, rlim)
+                    for aid in _admin_ids():
+                        try:
+                            await ctx.bot.send_message(
+                                int(aid),
+                                f"📈 🧾 Request limit: `{ks.masked}` hit {rhit[-1]}%\n{rbar}\n🎯 Shift to next key at 100%",
+                                parse_mode="Markdown")
+                        except Exception:
+                            pass
+        else:
+            ms.pop(f"req:{ks.masked}", None)
+
     ctx.bot_data["ms_seeded"] = True
     try:
         every = int(os.getenv("LIVE_DIGEST_MIN", "0"))
@@ -946,9 +1193,10 @@ async def live_progress(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
     """Background job: alert when a key hits budget / all keys over budget."""
+    import time
     pool = ctx.bot_data["pool"]
     prev: dict = ctx.bot_data.setdefault("prev_over", {})
-    cur = {k.masked: (k.over_budget() or k.disabled) for k in pool.keys}
+    cur = {k.masked: (not k.available) for k in pool.keys}
     if not prev:
         ctx.bot_data["prev_over"] = cur
         return
@@ -956,10 +1204,15 @@ async def watch_keys(ctx: ContextTypes.DEFAULT_TYPE):
         was = prev.get(masked, False)
         if out and not was:
             ks = next((k for k in pool.keys if k.masked == masked), None)
-            why = "disabled" if ks and ks.disabled else f"budget hit ({_fmt(ks.tokens_used)} tokens)"
+            why = ks.status_reason() if ks and hasattr(ks, "status_reason") else (
+                "disabled" if ks and ks.disabled else "budget hit"
+            )
             for aid in _admin_ids():
                 try:
-                    await ctx.bot.send_message(int(aid), f"⚠️ Key out: `{masked}`\n{why}", parse_mode="Markdown")
+                    await ctx.bot.send_message(
+                        int(aid),
+                        f"⚠️ Key out of rotation: `{masked}`\nReason: *{why}*\n🎯 Shifted to next available key.",
+                        parse_mode="Markdown")
                 except Exception:
                     pass
         elif was and not out:
