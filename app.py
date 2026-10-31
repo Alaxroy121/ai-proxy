@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1534,11 +1535,14 @@ async def proxy_request(request: Request):
 
             if want_stream:
                 body_out = body
+                client_wanted_usage = False
                 if clean_path.endswith("/chat/completions") or clean_path.endswith("/completions"):
                     try:
                         payload = json.loads(body) if body else {}
                         if isinstance(payload, dict):
                             so = payload.get("stream_options")
+                            if isinstance(so, dict) and so.get("include_usage"):
+                                client_wanted_usage = True
                             if not isinstance(so, dict):
                                 payload["stream_options"] = {"include_usage": True}
                                 body_out = json.dumps(payload).encode()
@@ -1582,12 +1586,109 @@ async def proxy_request(request: Request):
                                         content={"error": text, "proxy_note": params_note})
                 await pool.mark_success(ks, is_inference=is_inference)
 
-                async def gen(_r=sresp, _c=sclient, _k=ks, _b=body_out):
+                async def gen(_r=sresp, _c=sclient, _k=ks, _b=body_out, _want_usage=client_wanted_usage):
                     buf = bytearray()
+                    line_buf = ""
+                    saw_finish = False
+                    last_id = "chatcmpl"
+                    last_model = ""
+                    done_seen = False
                     try:
                         async for chunk in _r.aiter_bytes():
                             buf.extend(chunk)
-                            yield chunk
+                            try:
+                                text_chunk = chunk.decode("utf-8", errors="replace")
+                            except Exception:
+                                yield chunk
+                                continue
+
+                            line_buf += text_chunk
+                            while "\n" in line_buf:
+                                line, line_buf = line_buf.split("\n", 1)
+                                stripped = line.strip()
+
+                                if not stripped:
+                                    yield b"\n"
+                                    continue
+
+                                if stripped == "data: [DONE]":
+                                    done_seen = True
+                                    if not saw_finish:
+                                        finish_chunk = {
+                                            "id": last_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": last_model,
+                                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                        }
+                                        yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                                        saw_finish = True
+                                    yield b"data: [DONE]\n\n"
+                                    continue
+
+                                if stripped.startswith("data: "):
+                                    payload_str = stripped[6:].strip()
+                                    try:
+                                        d = json.loads(payload_str)
+                                    except Exception:
+                                        yield (line + "\n").encode("utf-8")
+                                        continue
+
+                                    if isinstance(d, dict):
+                                        if d.get("id"):
+                                            last_id = d["id"]
+                                        if d.get("model"):
+                                            last_model = d["model"]
+
+                                        choices = d.get("choices")
+                                        has_usage = "usage" in d
+
+                                        if isinstance(choices, list):
+                                            for ch in choices:
+                                                if isinstance(ch, dict) and ch.get("finish_reason"):
+                                                    saw_finish = True
+
+                                            # Upstream usage chunk: sanitize choices to [] per OpenAI spec
+                                            # so a trailing empty choice does not overwrite finish_reason
+                                            if has_usage:
+                                                if not _want_usage:
+                                                    continue
+                                                d["choices"] = []
+                                                yield f"data: {json.dumps(d)}\n\n".encode("utf-8")
+                                                continue
+                                            elif choices and saw_finish and all(
+                                                isinstance(c, dict)
+                                                and not c.get("finish_reason")
+                                                and not c.get("delta", {}).get("content")
+                                                and not c.get("delta", {}).get("reasoning_content")
+                                                for c in choices
+                                            ):
+                                                continue
+
+                                        if has_usage and not _want_usage:
+                                            continue
+
+                                        yield f"data: {json.dumps(d)}\n\n".encode("utf-8")
+                                        continue
+
+                                yield (line + "\n").encode("utf-8")
+
+                        if line_buf.strip():
+                            yield (line_buf + "\n").encode("utf-8")
+
+                        if not saw_finish:
+                            finish_chunk = {
+                                "id": last_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": last_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                            saw_finish = True
+
+                        if not done_seen:
+                            yield b"data: [DONE]\n\n"
                     finally:
                         try:
                             await _r.aclose()
