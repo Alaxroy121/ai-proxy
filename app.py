@@ -1407,11 +1407,19 @@ async def health():
     used = sum(s["tokens_used"] for s in st)
     caps = [s["limit"] for s in st]
     cap = sum(caps) if caps and all(c > 0 for c in caps) else None
-    return {"ok": True, "mode": "path-pinned",
-            "sites": [s["id"] for s in sites.sites],
-            "keys_total": len(st), "keys_available": avail,
-            "tokens_used_total": used, "tokens_capacity_total": cap,
-            "store_ok": pool.store_ok, "pending_updates": pool.pending_count()}
+    return {
+        "ok": True,
+        "mode": "path-pinned",
+        "sites": [s["id"] for s in sites.sites],
+        "keys_total": len(st),
+        "keys_available": avail,
+        "tokens_used_total": used,
+        "tokens_capacity_total": cap,
+        "store": pool.store.label if pool.store else "none",
+        "store_ok": pool.store_ok,
+        "store_error": pool.last_store_error,
+        "pending_updates": pool.pending_count(),
+    }
 
 
 @app.get("/keys/status")
