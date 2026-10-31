@@ -1227,28 +1227,46 @@ async def cmd_siterm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_sitelimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /sitelimit <V1..V10> <tokens>  e.g. /sitelimit V1 50000 (0 = global default)")
+    if len(ctx.args) != 2:
+        return await update.message.reply_text("Usage: /sitelimit <V1..V10> <tokens|0|off>  e.g. /sitelimit V1 0 (0 = unlimited)")
     import app as appmod
-    ok = await appmod.sites.configure_site(ctx.args[0], token_budget=int(ctx.args[1]))
+    val_str = ctx.args[1].lower().strip()
+    if val_str in ("0", "off", "unlim", "unlimited", "none", "-1"):
+        budget = -1
+        desc = "`unlimited` (token limit disabled for this site)"
+    elif val_str.isdigit():
+        budget = int(val_str)
+        desc = f"`{budget:,}` tokens"
+    else:
+        return await update.message.reply_text("Usage: /sitelimit <V1..V10> <tokens|0|off>")
+    ok = await appmod.sites.configure_site(ctx.args[0], token_budget=budget)
     if not ok:
         return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
-        f"⚙️ Default token budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
+        f"⚙️ Token budget on `{appmod.SiteManager.norm(ctx.args[0])}`: {desc}" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
 
 
 async def cmd_sitereqlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await _deny(update)
-    if len(ctx.args) != 2 or not ctx.args[1].isdigit():
-        return await update.message.reply_text("Usage: /sitereqlimit <V1..V10> <n>  e.g. /sitereqlimit V1 5000 (0 = unlimited)")
+    if len(ctx.args) != 2:
+        return await update.message.reply_text("Usage: /sitereqlimit <V1..V10> <n|0|off>  e.g. /sitereqlimit V1 50 (0 = unlimited)")
     import app as appmod
-    ok = await appmod.sites.configure_site(ctx.args[0], req_budget=int(ctx.args[1]))
+    val_str = ctx.args[1].lower().strip()
+    if val_str in ("0", "off", "unlim", "unlimited", "none", "-1"):
+        budget = -1
+        desc = "`unlimited` (request limit disabled for this site)"
+    elif val_str.isdigit():
+        budget = int(val_str)
+        desc = f"`{budget:,}` requests"
+    else:
+        return await update.message.reply_text("Usage: /sitereqlimit <V1..V10> <n|0|off>")
+    ok = await appmod.sites.configure_site(ctx.args[0], req_budget=budget)
     if not ok:
         return await update.message.reply_text("❓ Unknown site (V1–V10).")
     await update.message.reply_text(
-        f"⚙️ Default request budget on `{appmod.SiteManager.norm(ctx.args[0])}`: `{int(ctx.args[1]):,}`" + appmod.sites.save_status_note(),
+        f"⚙️ Request budget on `{appmod.SiteManager.norm(ctx.args[0])}`: {desc}" + appmod.sites.save_status_note(),
         parse_mode="Markdown")
 
 

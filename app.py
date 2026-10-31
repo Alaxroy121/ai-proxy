@@ -112,7 +112,11 @@ class KeyState:
         if self.token_limit > 0:
             return self.token_limit
         sb = site_token_budget(self.site)
-        return sb if sb > 0 else MAX_TOKENS_PER_KEY
+        if sb < 0:
+            return 0  # site explicitly set to unlimited
+        if sb > 0:
+            return sb
+        return MAX_TOKENS_PER_KEY
 
     def eff_req_limit(self) -> int:
         if self.req_limit < 0:
@@ -120,7 +124,11 @@ class KeyState:
         if self.req_limit > 0:
             return self.req_limit
         sb = site_req_budget(self.site)
-        return sb if sb > 0 else MAX_REQS_PER_KEY
+        if sb < 0:
+            return 0  # site explicitly set to unlimited
+        if sb > 0:
+            return sb
+        return MAX_REQS_PER_KEY
 
     def over_budget(self) -> bool:
         tlim = self.eff_token_limit()
@@ -148,7 +156,7 @@ class KeyState:
         import time
         if self.cooldown_until > time.time():
             left = int(self.cooldown_until - time.time())
-            return f"rate-limited ({left}s cooldown)"
+            return f"upstream rate-limited (HTTP 429, {left}s cooldown)"
         tlim = self.eff_token_limit()
         rlim = self.eff_req_limit()
         t_over = tlim > 0 and self.tokens_used >= tlim
@@ -773,9 +781,9 @@ class SiteManager:
                 self.sites.append(hit)
                 self.sites = self._sort_sites(self.sites)
             if token_budget is not None:
-                hit["token_budget"] = max(0, int(token_budget))
+                hit["token_budget"] = int(token_budget)
             if req_budget is not None:
-                hit["req_budget"] = max(0, int(req_budget))
+                hit["req_budget"] = int(req_budget)
             if timeout is not None:
                 hit["timeout"] = max(0, int(timeout))
             if referer is not None:
@@ -1186,13 +1194,23 @@ def count_stream_tokens(req_body: bytes, stream_bytes: bytes) -> tuple:
     return est_total, 0
 
 
-def _parse_retry_after(header: Optional[str]) -> Optional[float]:
-    if not header:
-        return None
-    try:
-        return max(5.0, min(3600.0, float(header.strip())))
-    except ValueError:
-        return None
+def _parse_retry_after(headers=None) -> float:
+    if headers:
+        ra = headers.get("retry-after") if hasattr(headers, "get") else None
+        if ra:
+            try:
+                return max(3.0, min(300.0, float(str(ra).strip())))
+            except ValueError:
+                pass
+        for h in ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset"):
+            val = headers.get(h) if hasattr(headers, "get") else None
+            if val:
+                try:
+                    cleaned = str(val).strip().rstrip("s").rstrip("m")
+                    return max(3.0, min(300.0, float(cleaned)))
+                except ValueError:
+                    pass
+    return 15.0
 
 
 @asynccontextmanager
@@ -1316,6 +1334,8 @@ async def check_proxy_auth(request: Request,
 
 
 def check_exhausted(status_code: int, body_text: str) -> Optional[str]:
+    if status_code == 429:
+        return None  # 429 is a temporary rate-limit, NEVER permanent quota exhaustion!
     low = body_text.lower()
     if status_code == 402:
         return "provider quota exhausted (402)"
@@ -1533,7 +1553,7 @@ async def proxy_request(request: Request):
                     if ex_reason:
                         await pool.mark_exhausted(ks, reason=ex_reason)
                     elif sresp.status_code == 429:
-                        retry_sec = _parse_retry_after(sresp.headers.get("retry-after")) or 60.0
+                        retry_sec = _parse_retry_after(sresp.headers)
                         await pool.mark_rate_limited(ks, retry_sec)
                     else:
                         await pool.mark_failed(ks)
@@ -1591,7 +1611,7 @@ async def proxy_request(request: Request):
             if ex_reason:
                 await pool.mark_exhausted(ks, reason=ex_reason)
             elif resp.status_code == 429:
-                retry_sec = _parse_retry_after(resp.headers.get("retry-after")) or 60.0
+                retry_sec = _parse_retry_after(resp.headers)
                 await pool.mark_rate_limited(ks, retry_sec)
             else:
                 await pool.mark_failed(ks)

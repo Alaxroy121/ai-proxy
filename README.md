@@ -81,9 +81,9 @@ V3_TITLE=Claude
 PROXY_API_KEY=your-secure-proxy-password
 PORT=8000
 
-# Budget Limits (0 = unlimited)
-MAX_TOKENS_PER_KEY=50000
-MAX_REQS_PER_KEY=1000
+# Budget Limits (0 = unlimited, default)
+MAX_TOKENS_PER_KEY=0
+MAX_REQS_PER_KEY=0
 
 # Optional Telegram DM Bot
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
