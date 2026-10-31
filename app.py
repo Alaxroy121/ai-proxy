@@ -1327,12 +1327,22 @@ def check_exhausted(status_code: int, body_text: str) -> Optional[str]:
     if status_code == 429:
         return None  # 429 is a temporary rate-limit, NEVER permanent quota exhaustion!
     low = body_text.lower()
+    # Client errors regarding invalid or unavailable models should NEVER exhaust the key
+    if "model" in low and any(
+        kw in low for kw in ("not available", "invalid", "not found", "access_denied", "does not exist", "unknown model")
+    ):
+        return None
+    if any(kw in low for kw in ("content_filter", "moderation", "safety")):
+        return None
     if status_code == 402:
         return "provider quota exhausted (402)"
     if status_code == 401:
         return "invalid/unauthorized key (401)"
     if status_code == 403:
-        return "access forbidden (403)"
+        # Only mark 403 exhausted if it explicitly refers to account suspension or balance
+        if any(m in low for m in EXHAUSTED_MARKERS) or "deactivated" in low or "suspended" in low:
+            return "access forbidden (403)"
+        return None
     for m in EXHAUSTED_MARKERS:
         if m in low:
             return f"provider quota exhausted ({m})"
