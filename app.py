@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1377,13 +1378,33 @@ def _wants_stream(request: Request, body: bytes) -> bool:
     return "text/event-stream" in request.headers.get("accept", "").lower()
 
 
+_DROP_HEADERS = {
+    "host",
+    "authorization",
+    "x-api-key",
+    "content-length",
+    "connection",
+    "accept-encoding",
+    "content-encoding",
+    "transfer-encoding",
+    "keep-alive",
+    "te",
+    "trailers",
+    "upgrade",
+    "proxy-connection",
+    "proxy-authorization",
+}
+
+
 def build_upstream_headers(incoming: Request, api_key: str, site_id: Optional[str] = None) -> dict:
     h = {}
     for k, v in incoming.headers.items():
         kl = k.lower()
-        if kl in ("host", "authorization", "x-api-key", "content-length", "connection"):
+        if kl in _DROP_HEADERS or kl.startswith("cf-") or kl.startswith("x-forwarded-"):
             continue
         h[k] = v
+    # Request uncompressed identity stream so upstream never sends zstd/br/gzip binary chunks into SSE
+    h["Accept-Encoding"] = "identity"
     if any(k.lower() == "x-api-key" for k in incoming.headers.keys()):
         h["X-Api-Key"] = api_key
     else:
@@ -1593,9 +1614,23 @@ async def proxy_request(request: Request):
                     last_id = "chatcmpl"
                     last_model = ""
                     done_seen = False
+
+                    # Stream decompression fallback if upstream ignores identity and forces gzip/deflate
+                    ce = (_r.headers.get("content-encoding") or "").lower()
+                    decompressor = None
+                    if "gzip" in ce:
+                        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    elif "deflate" in ce:
+                        decompressor = zlib.decompressobj()
+
                     try:
                         async for chunk in _r.aiter_bytes():
                             buf.extend(chunk)
+                            if decompressor is not None:
+                                try:
+                                    chunk = decompressor.decompress(chunk)
+                                except Exception as e:
+                                    print(f"[stream] decompression error: {e}")
                             try:
                                 text_chunk = chunk.decode("utf-8", errors="replace")
                             except Exception:
@@ -1717,6 +1752,15 @@ async def proxy_request(request: Request):
 
             if resp.status_code < 400:
                 data = resp.json() if resp.content else {}
+                if isinstance(data, dict):
+                    choices = data.get("choices")
+                    if isinstance(choices, list):
+                        for c in choices:
+                            if isinstance(c, dict):
+                                msg = c.get("message")
+                                if isinstance(msg, dict):
+                                    if not msg.get("content") and msg.get("reasoning_content"):
+                                        msg["content"] = msg["reasoning_content"]
                 await pool.mark_success(ks, *count_tokens(body, resp.content, data), is_inference=is_inference)
                 return JSONResponse(status_code=resp.status_code, content=data)
 
