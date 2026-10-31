@@ -455,7 +455,10 @@ class KeyPool:
         try:
             docs = await store.load()
         except Exception as e:
-            print(f"[store] load from {store.label} failed: {e}; keeping local keys")
+            err_msg = str(e)
+            print(f"[store] load from {store.label} failed: {err_msg}; keeping local keys")
+            self.store_ok = False
+            self.last_store_error = f"Store load failed: {err_msg[:120]}"
             docs = []
         if docs:
             async with self._lock:
@@ -1210,9 +1213,14 @@ async def lifespan(app: FastAPI):
     store = build_store(KEYS_FILE)
     try:
         await store.connect()
+        pool.store_ok = True
+        pool.last_store_error = ""
         print(f"[store] using {store.label}")
     except Exception as e:
-        print(f"[store] {e}; falling back to local file")
+        err_msg = str(e)
+        print(f"[store] Mongo connect failed: {err_msg}; falling back to local file")
+        pool.store_ok = False
+        pool.last_store_error = f"Mongo connect failed: {err_msg[:120]}"
         store = FileStore(KEYS_FILE)
     app.state.store = store
     await pool.use_store(store)
@@ -1418,7 +1426,10 @@ async def keys_status(_=Depends(check_proxy_auth)):
 @app.post("/keys/reload")
 async def keys_reload(_=Depends(check_proxy_auth)):
     load_dotenv(override=True)
-    await pool.reload(parse_keys(os.getenv("API_KEYS", "")))
+    if pool.store is not None and getattr(pool.store, "name", "") == "mongo":
+        await pool.use_store(pool.store)
+    else:
+        await pool.reload(parse_keys(os.getenv("API_KEYS", "")))
     return {"reloaded": pool.size}
 
 

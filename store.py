@@ -141,6 +141,15 @@ class MongoStore:
             raise RuntimeError("motor not installed: pip install motor") from e
         self.client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=8000)
         await self.client.admin.command("ping")  # fail fast if unreachable
+        # If db_name is the default "ai_proxy", check if connection URI specified a default db
+        if self.db_name == "ai_proxy":
+            try:
+                def_db = self.client.get_default_database()
+                if def_db is not None and def_db.name:
+                    self.db_name = def_db.name
+                    self.label = f"mongo:{self.db_name}.proxy_keys"
+            except Exception:
+                pass
         self.col = self.client[self.db_name]["proxy_keys"]
 
     async def close(self):
@@ -152,8 +161,15 @@ class MongoStore:
         docs = await self.col.find().sort("order", 1).to_list(length=1000)
         out = []
         for d in docs:
+            # Handle both _id and 'key' field, and stringify ObjectIds safely
+            raw_key = d.get("key") or d.get("_id")
+            if not raw_key:
+                continue
+            key_str = str(raw_key).strip()
+            if not key_str:
+                continue
             out.append({
-                "key": d.get("_id"),
+                "key": key_str,
                 "order": d.get("order", 0),
                 "site": d.get("site") or "V1",
                 "tokens_used": int(d.get("tokens_used", 0)),
@@ -168,7 +184,8 @@ class MongoStore:
         return [d for d in out if d["key"]]
 
     async def save_keys(self, keys):
-        for item in _norm_key_items(keys):
+        items = _norm_key_items(keys)
+        for item in items:
             k = item["key"]
             await self.col.update_one(
                 {"_id": k},
@@ -178,7 +195,9 @@ class MongoStore:
                  "$set": {"order": item["order"], "site": item["site"]}},
                 upsert=True,
             )
-        await self.col.delete_many({"_id": {"$nin": [d["key"] for d in _norm_key_items(keys)]}})
+        # CRITICAL SAFETY: Never purge all keys if items list is empty!
+        if items:
+            await self.col.delete_many({"_id": {"$nin": [d["key"] for d in items]}})
 
     async def update_key(self, key: str, tokens: int = 0, cached: int = 0, success: int = 0,
                          fails: int = 0, reqs: int = 0, disabled: Optional[bool] = None,
@@ -229,5 +248,15 @@ def build_store(keys_file: str):
     import os
     uri = os.getenv("MONGODB_URI", "").strip()
     if uri:
-        return MongoStore(uri, os.getenv("MONGODB_DB", "ai_proxy"))
+        db_name = os.getenv("MONGODB_DB", "").strip()
+        if not db_name:
+            try:
+                import urllib.parse
+                parsed = urllib.parse.urlparse(uri)
+                path = parsed.path.strip("/")
+                if path:
+                    db_name = path.split("/")[0]
+            except Exception:
+                pass
+        return MongoStore(uri, db_name or "ai_proxy")
     return FileStore(keys_file)

@@ -127,9 +127,15 @@ def panel_text(pool) -> str:
         badge = _site_badge(keys)
         title_suffix = f" · `{s['title'][:12]}`" if s.get("title") else ""
         site_lines.append(f"{badge} `{s['id']}` *{usable}/{len(keys)}*{title_suffix}")
-    store = "ok" if getattr(pool, "store_ok", True) else "lag"
+    store_ok = getattr(pool, "store_ok", True)
+    store = "ok" if store_ok else "⚠️ issue"
+    store_err = getattr(pool, "last_store_error", "")
     pend = pool.pending_count()
-    tail = f"\n⚠️ `{pend}` updates unsynced" if pend else ""
+    tail = ""
+    if pend:
+        tail += f"\n⚠️ `{pend}` updates unsynced"
+    if store_err and not store_ok:
+        tail += f"\n⚠️ Storage error: `{store_err[:80]}`"
     return (
         "🤖 *Proxy Control (V1–V10)*\n"
         f"🔑 *{avail}/{total}* keys ready · 💾 store {store}\n\n"
@@ -584,7 +590,10 @@ def render_stats(pool, site_filter=None) -> str:
 
 def render_config(pool=None) -> str:
     import app as appmod
+    store_ok = getattr(pool, "store_ok", True) if pool is not None else True
     store = pool.store.label if pool is not None and pool.store else "file"
+    if not store_ok and pool is not None and getattr(pool, "last_store_error", ""):
+        store += f" (⚠️ {pool.last_store_error[:60]})"
     sitelines = []
     for s in appmod.sites.sites:
         bits = ""
@@ -830,16 +839,21 @@ def _make_health(pool):
     avail = sum(1 for k in pool.keys if k.available)
     used = sum(k.tokens_used for k in pool.keys)
     pend = pool.pending_count()
-    store = "ok" if getattr(pool, "store_ok", True) else "⚠️ failing"
+    store_ok = getattr(pool, "store_ok", True)
+    store = "ok" if store_ok else "⚠️ issue"
+    store_err = getattr(pool, "last_store_error", "")
+    label = pool.store.label if pool is not None and pool.store else "file"
     req_used = sum(k.req_used for k in pool.keys)
     req_cap = _req_cap_sum(pool.keys)
     has_req = any(k.eff_req_limit() > 0 for k in pool.keys)
 
     lines = [
         "❤️ *Proxy Health (V1–V10)*",
-        f"🔑 Keys: *{avail}/{total}* usable · 💾 {store}",
+        f"🔑 Keys: *{avail}/{total}* usable · 💾 {label} ({store})",
         f"📊 Tokens total: {_bar(used, _cap_sum(pool.keys))}",
     ]
+    if store_err and not store_ok:
+        lines.append(f"⚠️ Store warning: `{store_err[:100]}`")
     if has_req or req_used > 0:
         lines.append(f"🧾 Requests total: {_bar(req_used, req_cap) if req_cap else f'`{req_used:,}` reqs'}")
     lines.append("")
