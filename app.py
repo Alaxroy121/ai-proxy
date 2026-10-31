@@ -143,9 +143,6 @@ class KeyState:
     def available(self) -> bool:
         if self.disabled or self.exhausted:
             return False
-        import time
-        if self.cooldown_until > time.time():
-            return False
         return not self.over_budget()
 
     def status_reason(self) -> str:
@@ -153,10 +150,6 @@ class KeyState:
             return "disabled"
         if self.exhausted:
             return self.exhausted_reason or "provider quota exhausted"
-        import time
-        if self.cooldown_until > time.time():
-            left = int(self.cooldown_until - time.time())
-            return f"upstream rate-limited (HTTP 429, {left}s cooldown)"
         tlim = self.eff_token_limit()
         rlim = self.eff_req_limit()
         t_over = tlim > 0 and self.tokens_used >= tlim
@@ -327,11 +320,8 @@ class KeyPool:
         self.outbox.add(ks.key, fails=1)
 
     async def mark_rate_limited(self, ks: KeyState, seconds: float = 60.0):
-        import time
-        async with self._lock:
-            ks.cooldown_until = max(ks.cooldown_until, time.time() + max(5.0, seconds))
-            ks.fails += 1
-        self.outbox.add(ks.key, fails=1)
+        # Rate-limit cooldowns disabled: simply record failure without locking key out
+        await self.mark_failed(ks)
 
     async def set_token_limit(self, ident: str, limit: int) -> Optional[str]:
         async with self._lock:
